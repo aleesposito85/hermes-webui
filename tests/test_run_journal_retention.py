@@ -24,8 +24,6 @@ import os
 import time
 from pathlib import Path
 
-import pytest
-
 from api import run_journal as rj
 
 

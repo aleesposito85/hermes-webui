@@ -1273,6 +1273,7 @@ def _archive_run_file(
     try:
         # 2. Compress + fsync into the pinned archive directory.
         src_fd = os.open(name, os.O_RDONLY | _O_NOFOLLOW, dir_fd=source_fd)
+        tmp_fd = None
         try:
             tmp_fd = os.open(
                 tmp_name,
@@ -1280,25 +1281,21 @@ def _archive_run_file(
                 0o600,
                 dir_fd=archive_fd,
             )
-            try:
-                with os.fdopen(src_fd, "rb", closefd=False) as src, os.fdopen(
-                    tmp_fd, "wb", closefd=False
-                ) as dst:
-                    with gzip.GzipFile(fileobj=dst, mode="wb", compresslevel=_ARCHIVE_GZIP_LEVEL) as gz:
-                        shutil.copyfileobj(src, gz, _RETENTION_VERIFY_CHUNK_BYTES)
-                os.fsync(tmp_fd)
-            finally:
-                for fd in (tmp_fd, src_fd):
-                    try:
-                        os.close(fd)
-                    except OSError:
-                        pass
-        except BaseException:
-            try:
-                os.close(src_fd)
-            except OSError:
-                pass
-            raise
+            with os.fdopen(src_fd, "rb", closefd=False) as src, os.fdopen(
+                tmp_fd, "wb", closefd=False
+            ) as dst:
+                with gzip.GzipFile(fileobj=dst, mode="wb", compresslevel=_ARCHIVE_GZIP_LEVEL) as gz:
+                    shutil.copyfileobj(src, gz, _RETENTION_VERIFY_CHUNK_BYTES)
+            os.fsync(tmp_fd)
+        finally:
+            # closefd=False above keeps ownership here; close exactly once each.
+            for fd in (tmp_fd, src_fd):
+                if fd is None:
+                    continue
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
 
         # 3. Verify the compressed copy reproduces the source exactly. The
         #    source bytes are read through the SAME pinned descriptor path, so
