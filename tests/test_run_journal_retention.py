@@ -208,18 +208,48 @@ def test_append_during_classification_aborts_archive(tmp_path, monkeypatch):
     assert path.exists()
 
 
-def test_existing_archive_is_never_clobbered(tmp_path):
-    """A second archive attempt for the same run id keeps the first copy."""
+def test_crash_window_archive_is_completed_not_clobbered(tmp_path):
+    """Archive published but live unlink never ran (crash): next pass completes it.
+
+    The live journal is append-only, so an existing archive is a PREFIX of the
+    current live bytes. A complete-for-the-current-bytes archive is left as-is
+    (and the live file dropped); one that no longer reproduces the live bytes
+    (the run grew after the crash) is replaced with a freshly verified copy —
+    never left as a truncated copy, which would silently lose the tail.
+    """
+    path = _write_run(tmp_path, "s1", "r1", mtime_age_days=30)
+    original = path.read_bytes()
+    existing = _archive_path(tmp_path, "s1", "r1")
+    existing.parent.mkdir(parents=True)
+    # Prefix-only archive: compresses just the first row, so it does NOT
+    # reproduce the current live bytes and must be replaced.
+    first_row = original.split(b"\n", 1)[0] + b"\n"
+    with gzip.open(existing, "wb") as fh:
+        fh.write(first_row)
+
+    counters = _sweep(tmp_path, ttl_days=14, max_runs_per_session=0, max_bytes_per_session=0)
+
+    assert counters["archived_files"] == 1
+    assert counters["errors"] == 0
+    assert not path.exists()  # live file dropped once the archive is complete
+    with gzip.open(existing, "rb") as fh:
+        assert fh.read() == original  # the FULL bytes, not the truncated prefix
+
+
+def test_complete_existing_archive_is_kept_and_live_file_dropped(tmp_path):
+    """A crash-window archive that already reproduces the live bytes is kept."""
     path = _write_run(tmp_path, "s1", "r1", mtime_age_days=30)
     existing = _archive_path(tmp_path, "s1", "r1")
     existing.parent.mkdir(parents=True)
     with gzip.open(existing, "wb") as fh:
-        fh.write(b'{"version":1,"seq":1,"run_id":"r1","session_id":"s1","terminal":true}\n')
+        fh.write(path.read_bytes())
     before = existing.read_bytes()
+
     counters = _sweep(tmp_path, ttl_days=14, max_runs_per_session=0, max_bytes_per_session=0)
-    assert counters["archived_files"] == 0
+
+    assert counters["archived_files"] == 1
+    assert not path.exists()
     assert existing.read_bytes() == before
-    assert path.exists()
 
 
 # ── reads fall back to the archive transparently ───────────────────────────

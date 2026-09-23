@@ -1303,19 +1303,29 @@ def _archive_run_file(
         # 3. Verify the compressed copy reproduces the source exactly. The
         #    source bytes are read through the SAME pinned descriptor path, so
         #    nothing can substitute a different file between the two reads.
-        if not _archive_reproduces_source(tmp_name, archive_fd, name, source_fd, st.st_size):
+        if not _archive_reproduces_source(tmp_name, archive_fd, name, source_fd):
             _unlink_archive_entry(tmp_name, archive_fd)
             return 0
 
-        # 4. Atomic no-replace publish (never clobber an existing archive of the
-        #    same run id — that older archive may be the only copy of its rows),
-        #    then 5. fsync the archive dir.
+        # 4. Atomic publish (never clobber), then 5. fsync the archive dir.
+        #    os.link fails with FileExistsError when an archive for this run id
+        #    is already present. That happens after a crash window (archive
+        #    published, live unlink did not run) or a racing attempt; the live
+        #    journal is append-only, so the existing archive is a prefix of the
+        #    current live bytes — if it no longer reproduces them (the live file
+        #    grew since), publish the freshly-verified copy over it; if it does,
+        #    it is already the complete copy.
         try:
             os.link(tmp_name, archive_path.name, src_dir_fd=archive_fd, dst_dir_fd=archive_fd)
         except FileExistsError:
+            if _archive_reproduces_source(archive_path.name, archive_fd, name, source_fd):
+                _unlink_archive_entry(tmp_name, archive_fd)
+            else:
+                os.replace(
+                    tmp_name, archive_path.name, src_dir_fd=archive_fd, dst_dir_fd=archive_fd
+                )
+        else:
             _unlink_archive_entry(tmp_name, archive_fd)
-            return 0
-        _unlink_archive_entry(tmp_name, archive_fd)
         try:
             os.fsync(archive_fd)
         except OSError:
@@ -1336,10 +1346,10 @@ def _archive_run_file(
         _unlink_archive_entry(f".{name}.gz.tmp.{os.getpid()}", archive_fd)
         return 0
 
-    # Confirmed archive: the live seq cache entry must go so a later run
-    # re-created at the same path restarts at seq 1. Eviction happens INSIDE the
-    # caller's held path lock (see `_archive_or_skip`) so it cannot race a
-    # concurrent append on the same path.
+    # Confirmed archive: the caller counts these bytes and drops the cached
+    # summary for the (now gone) live path. The seq cache entry is intentionally
+    # kept — reads merge the archived rows back in, so a hypothetical append at
+    # the same path continues seqs at N+1 rather than restarting at 1.
     return int(st.st_size)
 
 
@@ -1351,22 +1361,29 @@ def _unlink_archive_entry(name: str, dir_fd: int) -> None:
 
 
 def _archive_reproduces_source(
-    tmp_name: str,
-    archive_fd: int,
+    gz_name: str,
+    gz_dir_fd: int,
     source_name: str,
     source_fd: int,
-    source_size: int,
 ) -> bool:
-    """True when the compressed temp decompresses to exactly the source bytes.
+    """True when ``gz_name`` (in ``gz_dir_fd``) decompresses to exactly the source bytes.
 
     Compares in fixed chunks (never buffering a multi-MB run in memory) and
     requires the decompressed stream to match length AND content. A mismatch
-    means a truncated or corrupt archive, so the live file is kept.
+    means a truncated, corrupt, or superseded archive, so the archive is never
+    preferred over the live file.
     """
     try:
-        gz_fd = os.open(tmp_name, os.O_RDONLY | _O_NOFOLLOW, dir_fd=archive_fd)
+        gz_fd = os.open(gz_name, os.O_RDONLY | _O_NOFOLLOW, dir_fd=gz_dir_fd)
+    except OSError:
+        return False
+    try:
         src_fd = os.open(source_name, os.O_RDONLY | _O_NOFOLLOW, dir_fd=source_fd)
     except OSError:
+        try:
+            os.close(gz_fd)
+        except OSError:
+            pass
         return False
     try:
         with os.fdopen(gz_fd, "rb", closefd=False) as gz_raw, os.fdopen(
@@ -1655,6 +1672,11 @@ def _sweep_session_entries(
     entries: list[tuple[str, os.stat_result]] = []
     for name in names:
         if not name.endswith(".jsonl"):
+            continue
+        # The run id must be a plain filename segment (the same character class
+        # as session ids). A filename can never contain "/", but this also
+        # rejects the "." / ".." shapes before they can reach `_archive_path`.
+        if not _SAFE_ID_RE.fullmatch(name[: -len(".jsonl")]):
             continue
         try:
             st = os.stat(name, dir_fd=session_fd, follow_symlinks=False)
