@@ -222,26 +222,36 @@ def _summary_cache_signature(path: Path) -> tuple[int, int, int, int, int] | Non
     original ``mtime_ns`` (e.g. an atomic replace) still invalidates the cache —
     ctime advances on any metadata/content change and cannot be forged back.
     Falls back to the archived copy (#7613) so an archived run's summary can
-    still be cached; the key stays the live path, so archiving invalidates any
-    cache entry created while the live file existed.
+    still be cached, and when BOTH copies exist (crash window / re-created run)
+    folds both stats into the signature so a change to either invalidates the
+    cached merged summary. The key stays the live path.
     """
+    live_stat = None
     try:
-        stat = path.stat()
+        live_stat = path.stat()
     except OSError:
-        archived = _archive_path_for(path)
-        if archived is None:
-            return None
+        pass
+    archived = _archive_path_for(path)
+    archive_stat = None
+    if archived is not None:
         try:
-            stat = archived.stat()
+            archive_stat = archived.stat()
         except OSError:
-            return None
-    return (
-        int(stat.st_dev),
-        int(stat.st_ino),
-        int(stat.st_size),
-        int(stat.st_mtime_ns),
-        int(stat.st_ctime_ns),
-    )
+            archive_stat = None
+    if live_stat is None and archive_stat is None:
+        return None
+    if live_stat is None:
+        live_stat = archive_stat
+    try:
+        return (
+            int(live_stat.st_dev),
+            int(live_stat.st_ino),
+            int(live_stat.st_size) + (int(archive_stat.st_size) if archive_stat else 0),
+            max(int(live_stat.st_mtime_ns), int(archive_stat.st_mtime_ns) if archive_stat else 0),
+            max(int(live_stat.st_ctime_ns), int(archive_stat.st_ctime_ns) if archive_stat else 0),
+        )
+    except OSError:
+        return None
 
 
 def _get_cached_summary(path: Path) -> dict | None:
@@ -1663,82 +1673,107 @@ def _sweep_session_entries(
     retained_bytes = 0
     size_cap_exceeded = False
     for rank, (name, st) in enumerate(entries):
-        if budget["remaining"] <= 0:
-            break
         size = int(st.st_size)
-        age_seconds = now - float(st.st_mtime)
         archived = False
-        # Settlement window: never archive a file a writer may still be
-        # appending to (post-terminal `metering` / `stream_end` rows arrive
-        # around the terminal row) or a client may still be reconnecting to.
-        if age_seconds >= _RETENTION_MIN_QUIESCENT_SECONDS:
-            over_ttl = ttl_days > 0 and age_seconds > ttl_days * 86400.0
-            over_count = max_runs > 0 and rank >= max_runs
-            # Size cap: archive from the newest-first prefix once the retained
-            # budget would be exceeded, and keep archiving everything older
-            # than the first overflow (sticky) so the live set is a contiguous
-            # newest-first prefix. The newest run (rank 0) is exempt so a
-            # session always keeps its most recent anchor; the TTL still
-            # archives it once it is old enough.
-            over_size = False
-            if max_bytes > 0 and rank > 0:
-                if size_cap_exceeded or (retained_bytes + size) > max_bytes:
-                    size_cap_exceeded = True
-                    over_size = True
-            if over_ttl or over_count or over_size:
-                file_fd: int | None = None
-                try:
-                    file_fd = os.open(name, os.O_RDONLY | _O_NOFOLLOW, dir_fd=session_fd)
-                    if not _journal_file_is_terminal(
-                        session_journal_dir / name, int(st.st_size), file_fd=file_fd
-                    ):
-                        counters["retained_open"] += 1
-                        continue
-                except OSError:
-                    continue
-                finally:
-                    if file_fd is not None:
-                        try:
-                            os.close(file_fd)
-                        except OSError:
-                            pass
-                # Archive under the same per-path lock appends use, so a
-                # trailing write either lands before (identity changes -> skip)
-                # or waits until the move is done. NOTE: the seq/summary caches
-                # are intentionally NOT evicted here — `_read_jsonl` merges the
-                # archive back in, so a hypothetical post-archive append still
-                # continues seqs correctly (N+1, not a restart at 1).
-                path = session_journal_dir / name
-                with _lock_for(path):
-                    archived_bytes = _archive_run_file(
-                        path,
-                        _archive_path(session_journal_dir.name, path.stem, session_root),
+        if budget["remaining"] > 0:
+            age_seconds = now - float(st.st_mtime)
+            # Settlement window: never archive a file a writer may still be
+            # appending to (post-terminal `metering` / `stream_end` rows arrive
+            # around the terminal row) or a client may still be reconnecting to.
+            if age_seconds >= _RETENTION_MIN_QUIESCENT_SECONDS:
+                over_ttl = ttl_days > 0 and age_seconds > ttl_days * 86400.0
+                over_count = max_runs > 0 and rank >= max_runs
+                # Size cap: archive from the newest-first prefix once the retained
+                # budget would be exceeded, and keep archiving everything older
+                # than the first overflow (sticky) so the live set is a contiguous
+                # newest-first prefix. The newest run (rank 0) is exempt so a
+                # session always keeps its most recent anchor; the TTL still
+                # archives it once it is old enough.
+                over_size = False
+                if max_bytes > 0 and rank > 0:
+                    if size_cap_exceeded or (retained_bytes + size) > max_bytes:
+                        size_cap_exceeded = True
+                        over_size = True
+                if over_ttl or over_count or over_size:
+                    archived = _try_archive_entry(
+                        session_root,
+                        session_journal_dir,
+                        name,
+                        st,
                         session_fd,
                         archive_fd,
-                        _stat_signature(st),
+                        counters,
+                        size,
+                        age_seconds,
+                        budget,
                     )
-                    if archived_bytes > 0:
-                        # Cached summary keyed on the (now gone) live file is
-                        # stale; drop it so the next read re-derives from the
-                        # archive. `_summary_cache_signature` also falls back to
-                        # the archive, so a later read re-caches correctly.
-                        _discard_cached_summary(path)
-                if archived_bytes > 0:
-                    archived = True
-                    counters["archived_files"] += 1
-                    counters["archived_bytes"] += archived_bytes
-                    budget["remaining"] -= archived_bytes
-                    logger.debug(
-                        "Run-journal retention archived %s (%s bytes, age %.1fd)",
-                        path,
-                        archived_bytes,
-                        age_seconds / 86400.0,
-                    )
-                else:
-                    counters["skipped_files"] += 1
         if not archived:
-            # Only bytes that stay live count against the per-session budget.
+            # Everything that stays live — including a run that could not be
+            # proven terminal — counts against the per-session budget.
             retained_bytes += size
+
+
+def _try_archive_entry(
+    session_root: Path,
+    session_journal_dir: Path,
+    name: str,
+    st: os.stat_result,
+    session_fd: int,
+    archive_fd: int,
+    counters: dict,
+    size: int,
+    age_seconds: float,
+    budget: dict,
+) -> bool:
+    """Attempt to archive one eligible run; True when it was archived."""
+    try:
+        file_fd = os.open(name, os.O_RDONLY | _O_NOFOLLOW, dir_fd=session_fd)
+    except OSError:
+        return False
+    try:
+        if not _journal_file_is_terminal(
+            session_journal_dir / name, int(st.st_size), file_fd=file_fd
+        ):
+            counters["retained_open"] += 1
+            return False
+    finally:
+        try:
+            os.close(file_fd)
+        except OSError:
+            pass
+    # Archive under the same per-path lock appends use, so a trailing write
+    # either lands before (identity changes -> skip) or waits until the move is
+    # done. NOTE: the seq/summary caches are intentionally NOT evicted here —
+    # `_read_jsonl` merges the archive back in, so a hypothetical post-archive
+    # append still continues seqs correctly (N+1, not a restart at 1).
+    path = session_journal_dir / name
+    with _lock_for(path):
+        archived_bytes = _archive_run_file(
+            path,
+            _archive_path(session_journal_dir.name, path.stem, session_root),
+            session_fd,
+            archive_fd,
+            _stat_signature(st),
+        )
+        if archived_bytes > 0:
+            # Cached summary keyed on the (now gone) live file is stale; drop it
+            # so the next read re-derives from the archive.
+            # `_summary_cache_signature` also falls back to the archive, so a
+            # later read re-caches correctly.
+            _discard_cached_summary(path)
+    if archived_bytes > 0:
+        counters["archived_files"] += 1
+        counters["archived_bytes"] += archived_bytes
+        budget["remaining"] -= archived_bytes
+        logger.debug(
+            "Run-journal retention archived %s (%s bytes, age %.1fd)",
+            path,
+            archived_bytes,
+            age_seconds / 86400.0,
+        )
+        return True
+    counters["skipped_files"] += 1
+    return False
 
 
 def _open_archive_dir(session_root: Path, session_id: str) -> int:
