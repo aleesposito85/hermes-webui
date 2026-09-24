@@ -308,6 +308,37 @@ def _archive_path_for(live_path: Path) -> Path | None:
     )
 
 
+def _archive_read_allowed(archive_path: Path) -> bool:
+    """True when ``archive_path`` may be opened as journal data (fail closed).
+
+    Archive reads must stay inside the journal tree: the archive root and the
+    per-session directory must be real directories (never symlinks) that resolve
+    within the archive root, and the ``.jsonl.gz`` entry itself must be a real
+    regular file. Without this a symlinked ``_run_journal_archive/<sid>`` (or a
+    swapped entry) could make readers serve an arbitrary external file as
+    journal rows.
+    """
+    archive_root = archive_path.parent.parent
+    if not archive_path.name.endswith(".jsonl.gz"):
+        return False
+    try:
+        if not _SAFE_ID_RE.fullmatch(archive_path.parent.name):
+            return False
+        if archive_root.is_symlink() or archive_path.parent.is_symlink():
+            return False
+        if not archive_root.is_dir() or not archive_path.parent.is_dir():
+            return False
+        root_real = os.path.realpath(archive_root)
+        session_real = os.path.realpath(archive_path.parent)
+        if session_real != root_real and not session_real.startswith(root_real + os.sep):
+            return False
+        if archive_path.is_symlink() or not archive_path.is_file():
+            return False
+    except OSError:
+        return False
+    return True
+
+
 def _read_run_file_text(path: Path) -> str | None:
     """Read a run file as text, transparently falling back to its archived copy.
 
@@ -381,6 +412,8 @@ def _merge_archive_and_live_text(archive_text: str, live_text: str) -> str:
 
 
 def _read_gz_text(archive_path: Path) -> str | None:
+    if not _archive_read_allowed(archive_path):
+        return None
     try:
         with gzip.open(archive_path, "rt", encoding="utf-8") as fh:
             return fh.read()
@@ -598,15 +631,18 @@ def _run_journal_file_bytes(path: Path):
 
     Raises FileNotFoundError when neither copy exists. The both-exist case is
     handled by the caller via :func:`_read_run_file_text` (it needs row-level
-    merging); this opener is for streaming reads of a single copy.
+    merging); this opener is for streaming reads of a single copy. Archived
+    copies must pass :func:`_archive_read_allowed` (containment, fail closed).
     """
     if path.suffix == ".gz":
+        if not _archive_read_allowed(path):
+            raise FileNotFoundError(str(path))
         return gzip.open(path, "rb")
     try:
         return path.open("rb")
     except FileNotFoundError:
         archived = _archive_path_for(path)
-        if archived is None:
+        if archived is None or not _archive_read_allowed(archived):
             raise
         return gzip.open(archived, "rb")
 
@@ -902,15 +938,55 @@ def session_journal_fingerprint(session_id: str, *, session_dir: Path | None = N
     return (count, max_mtime, total_size)
 
 
-def _glob_archived_run_paths(journal_root: Path, run_id: str) -> list[Path]:
-    """Archived ``<rid>.jsonl.gz`` paths for a run id, as archive-dir Paths."""
-    archive_root = journal_root.parent / RUN_JOURNAL_ARCHIVE_DIR_NAME
-    if not archive_root.exists():
-        return []
+def _archive_contained_session_dirs(archive_root: Path) -> list[Path]:
+    """Archive session dirs that provably stay inside the archive root.
+
+    Mirrors the live sweep's containment discipline: a session directory that is
+    a symlink (or resolves outside the archive root) is never trusted, so a
+    swapped pathname cannot make repository readers serve an external file as
+    journal data.
+    """
     try:
-        return sorted(archive_root.glob(f"*/{run_id}.jsonl.gz"))
+        if not archive_root.is_dir() or archive_root.is_symlink():
+            return []
+        root_real = os.path.realpath(archive_root)
+        out: list[Path] = []
+        for entry in sorted(archive_root.iterdir()):
+            if not _SAFE_ID_RE.fullmatch(entry.name):
+                continue
+            if entry.is_symlink() or not entry.is_dir():
+                continue
+            try:
+                resolved = os.path.realpath(entry)
+            except OSError:
+                continue
+            if resolved != root_real and not resolved.startswith(root_real + os.sep):
+                continue
+            out.append(entry)
+        return out
     except OSError:
         return []
+
+
+def _glob_archived_run_paths(journal_root: Path, run_id: str) -> list[Path]:
+    """Archived ``<rid>.jsonl.gz`` paths for a run id, as archive-dir Paths.
+
+    Only session directories that pass :func:`_archive_contained_session_dirs`
+    are searched, and the returned path is re-checked to be inside the archive
+    root — archived reads fail closed rather than following a symlinked
+    directory out of the journal tree.
+    """
+    archive_root = journal_root.parent / RUN_JOURNAL_ARCHIVE_DIR_NAME
+    out: list[Path] = []
+    for session_dir in _archive_contained_session_dirs(archive_root):
+        candidate = session_dir / f"{run_id}.jsonl.gz"
+        try:
+            if candidate.is_symlink() or not candidate.is_file():
+                continue
+        except OSError:
+            continue
+        out.append(candidate)
+    return sorted(out)
 
 
 def find_run_summary(run_id: str, *, session_dir: Path | None = None) -> dict | None:
@@ -976,11 +1052,16 @@ def _session_run_paths(root: Path, sid: str, session_root: Path) -> list[Path]:
     except OSError:
         pass
     archive_session_root = root / RUN_JOURNAL_ARCHIVE_DIR_NAME / sid
+    # Containment: only a real (non-symlinked) session directory inside the
+    # archive root is searched, and each entry must pass `_archive_read_allowed`.
     try:
-        for archived in archive_session_root.glob("*.jsonl.gz"):
-            stem = archived.name[: -len(".jsonl.gz")]
-            if stem not in paths:
-                paths[stem] = session_root / f"{stem}.jsonl"
+        if _SAFE_ID_RE.fullmatch(sid) and not archive_session_root.is_symlink():
+            for archived in sorted(archive_session_root.glob("*.jsonl.gz")):
+                if not _archive_read_allowed(archived):
+                    continue
+                stem = archived.name[: -len(".jsonl.gz")]
+                if stem not in paths:
+                    paths[stem] = session_root / f"{stem}.jsonl"
     except OSError:
         pass
     return [paths[key] for key in sorted(paths)]
@@ -1350,11 +1431,89 @@ def _archive_run_file(
     return int(st.st_size)
 
 
-def _unlink_archive_entry(name: str, dir_fd: int) -> None:
+def _stat_identity(st: os.stat_result) -> tuple[int, int, int, int]:
+    """Identity that survives a rename: ``(dev, ino, size, mtime_ns)``.
+
+    Used to verify a prune CLAIM. ``st_ctime_ns`` cannot be part of this check
+    because the claim itself is made by renaming the entry, and a rename bumps
+    ctime by definition — including it would reject every legitimate claim.
+    Replacing an entry goes through unlink/rename-over, which always lands a
+    different inode (and any rewrite moves size or mtime), so a replacement is
+    still detected.
+    """
+    return (int(st.st_dev), int(st.st_ino), int(st.st_size), int(st.st_mtime_ns))
+
+
+def _prune_archive_entry(name: str, checked_stat: os.stat_result, dir_fd: int) -> bool:
+    """Delete an aged archive entry by CLAIMING it first, then verifying.
+
+    The age check ``stat()``s a mutable NAME, so a concurrent sweep that
+    completes/replaces the archive at that path between the check and the
+    unlink would otherwise see its freshly published copy — the only retained
+    copy after archival — deleted. A last-moment identity re-check only narrows
+    that window; it does not close it.
+
+    Instead the entry is atomically CLAIMED by renaming it to a private name,
+    so from that instant nothing else can mutate what we hold. The claim is then
+    verified against the signature the age check recorded:
+
+      * same identity  -> it is provably the aged entry -> unlink the claim;
+      * different      -> we claimed a REPLACEMENT someone published after the
+                          check -> restore it without ever clobbering the
+                          canonical name (``link`` fails closed on EEXIST; an
+                          archive only ever grows, so if the name was taken
+                          again the newer copy supersedes this one and the
+                          claim is dropped).
+
+    Returns True only when the aged entry was removed.
+    """
+    claim = f".{name}.prune-claim.{os.getpid()}"
+    try:
+        os.rename(name, claim, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    except OSError:
+        # Vanished (another sweep pruned/replaced it) — nothing to do.
+        return False
+    try:
+        st = os.stat(claim, dir_fd=dir_fd, follow_symlinks=False)
+    except OSError:
+        return False
+    if not stat.S_ISREG(st.st_mode) or _stat_identity(st) != _stat_identity(checked_stat):
+        # Not the entry the age check saw: put it back. `link` restores the
+        # exact inode and fails closed (EEXIST) rather than clobbering a newer
+        # archive published at the canonical name.
+        _restore_prune_claim(claim, name, dir_fd)
+        return False
+    return _unlink_archive_entry(claim, dir_fd)
+
+
+def _restore_prune_claim(claim: str, name: str, dir_fd: int) -> None:
+    """Undo a prune claim: restore ``claim`` to ``name``, else drop it safely.
+
+    Restoring uses ``link`` (never clobbers): when the canonical name is free
+    the claimed inode goes back — a resurrected archive only over-retains. When
+    a newer archive already occupies the name, the claim is redundant (readers
+    resolve the canonical entry) and is dropped. On any other failure the claim
+    file is LEFT IN PLACE: a stray dot-file is recoverable, a deleted archive
+    is not — and the next sweep's cleanup re-tries it.
+    """
+    try:
+        os.link(claim, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd, follow_symlinks=False)
+        os.unlink(claim, dir_fd=dir_fd)
+    except FileExistsError:
+        try:
+            os.unlink(claim, dir_fd=dir_fd)
+        except OSError:
+            pass
+    except OSError:
+        logger.warning("Run-journal prune claim left in place (restore failed): %s", claim, exc_info=True)
+
+
+def _unlink_archive_entry(name: str, dir_fd: int) -> bool:
     try:
         os.unlink(name, dir_fd=dir_fd)
+        return True
     except OSError:
-        pass
+        return False
 
 
 def _archive_reproduces_source(
@@ -1635,7 +1794,18 @@ def resolve_run_journal_retention_caps() -> dict:
 
 
 def _cleanup_archive_temps(archive_fd: int) -> None:
-    """Remove stray ``.gz.tmp`` entries left by an interrupted archive attempt."""
+    """Recover stray archive-directory debris left by an interrupted pass.
+
+    Two shapes:
+
+      * ``.gz.tmp.`` — an aborted archive attempt (the live file survived, so the
+        temp is garbage);
+      * ``.prune-claim.`` — a prune that was interrupted after claiming an entry
+        (crash/power loss between ``rename`` and ``unlink``). The claimed entry
+        may be the ONLY copy of that run, so it is RESTORED to its canonical
+        name (never deleted); if the canonical name is occupied the claim is a
+        redundant older copy and is dropped.
+    """
     try:
         names = sorted(os.listdir(archive_fd))
     except OSError:
@@ -1643,6 +1813,26 @@ def _cleanup_archive_temps(archive_fd: int) -> None:
     for name in names:
         if ".gz.tmp." in name:
             _unlink_archive_entry(name, archive_fd)
+            continue
+        marker = ".prune-claim."
+        idx = name.find(marker)
+        if idx < 0 or not name.startswith("."):
+            continue
+        original = name[1:idx]
+        if not original.endswith(".jsonl.gz"):
+            continue
+        try:
+            st = os.stat(name, dir_fd=archive_fd, follow_symlinks=False)
+        except OSError:
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            continue
+        # A claim is only restorable when it is OLDER than the prune window —
+        # a live prune holds its claim only for microseconds, so anything past
+        # the settlement window is debris from an interrupted pass.
+        if time.time() - float(st.st_mtime) < _RETENTION_MIN_QUIESCENT_SECONDS:
+            continue
+        _restore_prune_claim(name, original, archive_fd)
 
 
 def _sweep_session_entries(
@@ -1883,8 +2073,11 @@ def _prune_run_journal_archive(session_root: Path, caps: dict, now: float, count
                     continue
                 if float(st.st_mtime) >= cutoff:
                     continue
-                _unlink_archive_entry(name, session_fd)
-                counters["pruned_archives"] += 1
+                # Identity is re-asserted inside the unlink (see
+                # `_prune_archive_entry`): a name republished since the age
+                # check must survive.
+                if _prune_archive_entry(name, st, session_fd):
+                    counters["pruned_archives"] += 1
         finally:
             try:
                 os.close(session_fd)

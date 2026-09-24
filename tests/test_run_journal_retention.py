@@ -515,3 +515,123 @@ def test_sweep_on_missing_root_is_a_noop(tmp_path):
     counters = _sweep(tmp_path / "nope", ttl_days=14, max_runs_per_session=0, max_bytes_per_session=0)
     assert counters["archived_files"] == 0
     assert counters["errors"] == 0
+
+
+# ── containment: archived reads must never escape the archive root ─────────
+
+
+def _symlinked_archive_dir_with_external_run(root: Path, sid: str, rid: str) -> Path:
+    """Point ``_run_journal_archive/<sid>`` at an EXTERNAL dir holding ``<rid>.jsonl.gz``.
+
+    Mirrors the escape reported on the PR: archive discovery used to follow the
+    symlinked session directory, so the external gzip was read as journal data.
+    """
+    outside = root.parent / f"{root.name}-outside-{sid}"
+    outside.mkdir(parents=True, exist_ok=True)
+    body = (
+        json.dumps(
+            {
+                "version": 1,
+                "event_id": f"{rid}:1",
+                "seq": 1,
+                "run_id": rid,
+                "session_id": sid,
+                "event": "token",
+                "type": "token",
+                "created_at": time.time() - 3600,
+                "terminal": True,
+                "terminal_state": "completed",
+                "payload": {"text": "EXTERNAL"},
+            },
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    with gzip.open(outside / f"{rid}.jsonl.gz", "wb") as fh:
+        fh.write(body.encode("utf-8"))
+    archive_root = root / rj.RUN_JOURNAL_ARCHIVE_DIR_NAME
+    archive_root.mkdir(parents=True, exist_ok=True)
+    (archive_root / sid).symlink_to(outside, target_is_directory=True)
+    return outside
+
+
+def test_symlinked_archive_session_dir_is_not_read(tmp_path):
+    """A symlinked archive session dir must never serve journal data (fail closed)."""
+    _symlinked_archive_dir_with_external_run(tmp_path, "s1", "evil")
+
+    assert rj.find_run_summary("evil", session_dir=tmp_path) is None
+    assert rj.find_run_file("evil", session_dir=tmp_path) is None
+    # `read_run_events`/`latest_run_summary` return an empty shape (not the
+    # external rows) when the only copy is behind an untrusted symlink.
+    result = rj.read_run_events("s1", "evil", session_dir=tmp_path)
+    assert result["events"] == []
+    summary = rj.latest_run_summary("s1", "evil", session_dir=tmp_path)
+    assert not (summary and summary.get("event_count"))
+    assert rj._read_jsonl(tmp_path / rj.RUN_JOURNAL_DIR_NAME / "s1" / "evil.jsonl")[0] == []
+
+
+def test_symlinked_archive_session_dir_not_in_replay(tmp_path):
+    """Session replay must not include a run reachable only through a symlinked archive dir."""
+    _symlinked_archive_dir_with_external_run(tmp_path, "s1", "evil")
+    _write_run(tmp_path, "s1", "ok", mtime_age_days=30)
+
+    replay = rj.read_session_run_events("s1", after_event_id="ok:1", session_dir=tmp_path)
+    run_ids = {event.get("run_id") for event in replay.get("events", [])}
+    assert "evil" not in run_ids
+
+
+def test_archive_read_falls_back_when_live_path_is_symlinked(tmp_path):
+    """A legitimate archive still reads when the ARCHIVE dir is a real directory."""
+    _write_run(tmp_path, "s1", "r1", mtime_age_days=30)
+    _sweep(tmp_path, ttl_days=14, max_runs_per_session=0, max_bytes_per_session=0)
+    assert _archive_path(tmp_path, "s1", "r1").exists()
+
+    summary = rj.latest_run_summary("s1", "r1", session_dir=tmp_path)
+    assert summary is not None and summary.get("run_id") == "r1"
+
+
+# ── pruning: a replacement archive must never be pruned ─────────────────────
+
+
+def test_archive_pruning_does_not_delete_replacement_archive(tmp_path, monkeypatch):
+    """Pruning claims the entry: a replacement published mid-prune survives.
+
+    Reproduces the PR finding: the prune stat()ed an entry's age, then unlinked
+    the mutable NAME later. A writer that republished that name between the two
+    steps lost its newly written archive (the only retained copy). The fix
+    claims the entry by rename, verifies the claim, and on a mismatch restores
+    it without clobbering the canonical name.
+    """
+    _write_run(tmp_path, "s1", "r1", mtime_age_days=800)
+    _sweep(tmp_path, ttl_days=14, max_runs_per_session=0, max_bytes_per_session=0)
+    archive = _archive_path(tmp_path, "s1", "r1")
+    assert archive.exists()
+    old = time.time() - 400 * 86400
+    os.utime(archive, (old, old))
+
+    # Simulate the race in the widest window: replace the entry at the moment
+    # the prune CLAIMS it (after the age check, before the identity verify).
+    fresh_body = b"FRESH REPLACEMENT ARCHIVE"
+    real_rename = os.rename
+    swapped = {"done": False}
+
+    def swap_then_claim(src, dst, **kwargs):
+        if not swapped["done"] and isinstance(src, str) and src.endswith(".jsonl.gz"):
+            swapped["done"] = True
+            archive.unlink()  # the aged entry the checker saw
+            archive.write_bytes(fresh_body)  # a NEW archive published at that name
+        return real_rename(src, dst, **kwargs)
+
+    monkeypatch.setattr(rj.os, "rename", swap_then_claim)
+    monkeypatch.setenv(rj._RETENTION_ARCHIVE_TTL_ENV, "90")
+    counters = rj.sweep_run_journal(
+        session_dir=tmp_path, ttl_days=0, max_runs_per_session=0, max_bytes_per_session=0
+    )
+    monkeypatch.undo()
+
+    assert archive.exists(), "replacement archive was deleted"
+    assert archive.read_bytes() == fresh_body
+    assert counters["pruned_archives"] == 0
+    # No claim debris left behind.
+    claims = list(archive.parent.glob("*.prune-claim.*"))
+    assert claims == []
