@@ -1025,6 +1025,100 @@ def test_deletion_refuses_symlinked_root_without_pinning_available(tmp_path, mon
     assert precious.exists(), "fallback followed a symlinked root"
 
 
+def test_fallback_deletion_never_gives_a_checked_path_to_rmtree(tmp_path, monkeypatch):
+    """The no-pin fallback must not hand a checked pathname to a recursive delete.
+
+    Reproduces the finding: the fallback checked ``journal_root``/``target`` for
+    symlinks and then passed the same mutable pathname to ``shutil.rmtree``, so
+    a swap landing between the two (journal root re-pointed at an external tree
+    holding a decoy ``s1/``) redirected the recursive delete outside the journal
+    tree and destroyed the external data. The claim-first implementation never
+    calls ``shutil.rmtree`` on a checked path at all.
+    """
+    path = _write_run(tmp_path, "s1", "r1", mtime_age_days=0)
+    session_dir = path.parent
+    external = tmp_path.parent / f"{tmp_path.name}-external-claim"
+    (external / "s1").mkdir(parents=True)
+    precious = external / "s1" / "PRECIOUS.txt"
+    precious.write_text("must survive", encoding="utf-8")
+    journal_root = tmp_path / rj.RUN_JOURNAL_DIR_NAME
+
+    rmtree_calls: list[str] = []
+    real_rmtree = shutil.rmtree
+
+    def swap_then_rmtree(target, *args, **kwargs):
+        # The swap that used to land between the containment checks and the
+        # recursive delete.
+        rmtree_calls.append(str(target))
+        if not journal_root.is_symlink():
+            os.rename(journal_root, tmp_path / "_run_journal-moved")
+            journal_root.symlink_to(external, target_is_directory=True)
+        return real_rmtree(target, *args, **kwargs)
+
+    monkeypatch.setattr(rj, "_DIR_FD_OK", False)
+    monkeypatch.setattr(rj, "_open_dir_no_follow", lambda _p: None)
+    monkeypatch.setattr(shutil, "rmtree", swap_then_rmtree)
+
+    result = rj.delete_run_journal("s1", session_dir=tmp_path)
+
+    assert precious.exists(), "deletion escaped the journal root"
+    assert rmtree_calls == [], f"a checked pathname reached shutil.rmtree: {rmtree_calls}"
+    assert result is True, "deletion did not complete for a normal session"
+    assert not session_dir.exists(), "transcripts left behind"
+
+
+def test_fallback_deletion_removes_link_entries_without_following_them(tmp_path, monkeypatch):
+    """Links inside the tree are removed as entries; their targets are untouched.
+
+    Guard for the no-pin fallback's entry-level semantics: a link entry is
+    removed as the ENTRY itself (its target is never entered) and the rest of
+    the tree is still cleared. Passes on the pre-fix implementation too
+    (``rmtree`` also unlinks links as entries) — kept so a future rewrite that
+    recurses through link targets fails here.
+    """
+    path = _write_run(tmp_path, "s1", "r1", mtime_age_days=0)
+    session_dir = path.parent
+    external = tmp_path.parent / f"{tmp_path.name}-external-inner"
+    external.mkdir(exist_ok=True)
+    precious = external / "PRECIOUS.txt"
+    precious.write_text("must survive", encoding="utf-8")
+    (session_dir / "linked").symlink_to(external, target_is_directory=True)
+
+    monkeypatch.setattr(rj, "_DIR_FD_OK", False)
+    monkeypatch.setattr(rj, "_open_dir_no_follow", lambda _p: None)
+
+    result = rj.delete_run_journal("s1", session_dir=tmp_path)
+
+    assert result is True, "deletion left the session tree behind"
+    assert not session_dir.exists()
+    assert precious.exists(), "deletion followed a link out of the tree"
+    assert external.is_dir()
+
+
+def test_fallback_deletion_finishes_a_claim_left_by_a_crash(tmp_path, monkeypatch):
+    """A claim left by an interrupted deletion is cleared on the next attempt.
+
+    The claim-first fallback renames the session entry before clearing it; an
+    interruption between those steps leaves the tree under the private claim
+    name. The next deletion for the same session must finish the job (the claim
+    is, by construction, this module's own debris) rather than leaving
+    recoverable transcripts behind.
+    """
+    path = _write_run(tmp_path, "s1", "r1", mtime_age_days=0)
+    session_dir = path.parent
+    stale = session_dir.parent / ".s1.delete-claim.999.deadbeef"
+    os.rename(session_dir, stale)
+
+    monkeypatch.setattr(rj, "_DIR_FD_OK", False)
+    monkeypatch.setattr(rj, "_open_dir_no_follow", lambda _p: None)
+
+    result = rj.delete_run_journal("s1", session_dir=tmp_path)
+
+    assert result is True
+    assert not stale.exists(), "claim debris still holds the transcripts"
+    assert not session_dir.exists()
+
+
 # ── ownership: the pinned raw handle must close on every exit path ──────────
 
 

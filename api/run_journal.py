@@ -1532,25 +1532,215 @@ def _remove_live_session_tree(session_root: Path, session_id: str) -> bool:
 
 
 def _remove_session_tree_by_path(session_root: Path, session_id: str) -> bool:
-    """Path-based removal of ``_run_journal/<sid>/`` (no-pin platforms only).
+    """Remove ``_run_journal/<sid>/`` on platforms that cannot pin handles.
 
-    Windows (no ``dir_fd``/``O_NOFOLLOW``) cannot pin handles, so this is the
-    only possible implementation there. It still refuses to follow a symlinked
-    FINAL component, then removes the tree by path. Used exclusively by the
-    privacy deletion path, where leaving a deleted session's transcripts behind
-    is the worse failure: the pinned form is used whenever the platform offers
-    it (see ``_remove_live_session_tree``).
+    Windows has no ``dir_fd``/``O_NOFOLLOW``, so the fd-relative deletion used on
+    POSIX is unavailable. A plain ``shutil.rmtree`` on the checked pathname is
+    check-then-use on a destructive operation: the containment checks and the
+    recursive delete independently resolve the same mutable path, so a path
+    swapped for a symlink (or Windows reparse point) in between redirects the
+    delete outside the journal tree.
+
+    Instead, every destructive step here acts on a private name THIS call
+    created with an atomic rename:
+
+      1. the session entry is CLAIMED by renaming it to
+         ``.<sid>.delete-claim.<pid>.<random>`` — rename operates on the entry
+         itself (never follows the final component), and the name is
+         unpredictable, so nothing else can be mutating what we hold;
+      2. the claim is verified with ``lstat`` — a link that was swapped in is
+         removed as an entry (its target is never entered);
+      3. the parent directory's identity is re-checked against the identity
+         captured before the claim: if the journal root itself was swapped, the
+         claim is RESTORED and deletion fails closed;
+      4. the tree is cleared bottom-up, recursing into a subdirectory only after
+         it too has been claimed by rename and verified (an entry-level rename
+         moves a swapped-in link as a link, never its target).
+
+    Debris from a deletion interrupted between (1) and (4) is recognized by its
+    claim prefix and finished by the next deletion of the same session.
+
+    Used exclusively by the privacy deletion path, where leaving a deleted
+    session's transcripts behind is the worse failure: the pinned form is used
+    whenever the platform offers it (see ``_remove_live_session_tree``).
     """
-    import shutil as _shutil
-
     journal_root = session_root / RUN_JOURNAL_DIR_NAME
-    target = journal_root / session_id
-    if journal_root.is_symlink() or target.is_symlink():
+    try:
+        root_st = os.lstat(journal_root)
+    except OSError:
         return False
-    if not target.exists():
+    if stat.S_ISLNK(root_st.st_mode) or not stat.S_ISDIR(root_st.st_mode):
         return False
-    _shutil.rmtree(target, ignore_errors=True)
-    return not target.exists()
+    root_identity = (int(root_st.st_dev), int(root_st.st_ino))
+
+    removed_any = False
+    claim_prefix = f".{session_id}.delete-claim."
+    # 1. Finish debris left by an interrupted deletion of this same session.
+    #    Debris is re-claimed with an atomic entry-level rename before it is
+    #    touched, exactly like the live entry below, so no destructive step
+    #    ever resolves a separately-checked name.
+    try:
+        with os.scandir(journal_root) as it:
+            debris = [e.name for e in it if e.name.startswith(claim_prefix)]
+    except OSError:
+        return False
+    for name in debris:
+        full = os.path.join(str(journal_root), name)
+        reclaimed = f"{full}.reclaim.{os.getpid()}.{os.urandom(4).hex()}"
+        try:
+            os.rename(full, reclaimed)
+        except OSError:
+            continue
+        try:
+            reclaimed_st = os.lstat(reclaimed)
+        except OSError:
+            continue
+        if stat.S_ISLNK(reclaimed_st.st_mode) or _path_is_junction(reclaimed):
+            _unlink_link_entry(reclaimed)
+            removed_any = True
+        elif stat.S_ISDIR(reclaimed_st.st_mode):
+            if _clear_claimed_tree(reclaimed):
+                removed_any = True
+        else:
+            try:
+                os.unlink(reclaimed)
+                removed_any = True
+            except OSError:
+                pass
+
+    # 2. Claim the live session entry (entry-level rename, never follows).
+    claim = os.path.join(
+        str(journal_root), f"{claim_prefix}{os.getpid()}.{os.urandom(4).hex()}"
+    )
+    try:
+        os.rename(os.path.join(str(journal_root), session_id), claim)
+    except OSError:
+        # Nothing live to remove (already gone, or not claimable).
+        return removed_any
+
+    # 3. Verify the claim landed where the check said it would. A parent swap
+    # between the identity capture and the claim would have moved a FOREIGN
+    # entry into our claim name; restore it and fail closed.
+    try:
+        parent_st = os.stat(journal_root)
+    except OSError:
+        return removed_any
+    if (int(parent_st.st_dev), int(parent_st.st_ino)) != root_identity:
+        try:
+            os.rename(claim, os.path.join(str(journal_root), session_id))
+        except OSError:
+            pass
+        return removed_any
+    try:
+        claim_st = os.lstat(claim)
+    except OSError:
+        return removed_any
+    if stat.S_ISLNK(claim_st.st_mode) or _path_is_junction(claim):
+        # A link was swapped in for the session entry: remove the ENTRY only.
+        return _unlink_link_entry(claim) or removed_any
+    if not stat.S_ISDIR(claim_st.st_mode):
+        return _unlink_link_entry(claim) or removed_any
+    ok = _clear_claimed_tree(claim)
+    return ok or removed_any
+
+
+def _entry_is_link(entry: os.DirEntry) -> bool:
+    """True when a directory entry is a symlink (or Windows junction)."""
+    try:
+        if entry.is_symlink():
+            return True
+    except OSError:
+        return False
+    is_junction = getattr(entry, "is_junction", None)
+    if is_junction is None:
+        return False
+    try:
+        return bool(is_junction())
+    except OSError:
+        return False
+
+
+def _path_is_junction(path: str) -> bool:
+    """True when ``path`` is a Windows junction (False elsewhere)."""
+    isjunction = getattr(os.path, "isjunction", None)
+    if isjunction is None:
+        return False
+    try:
+        return bool(isjunction(path))
+    except OSError:
+        return False
+
+
+def _unlink_link_entry(path: str) -> bool:
+    """Remove a link/junction ENTRY without following it; True on success.
+
+    POSIX removes a symlink with ``unlink``; Windows removes a directory
+    symlink or junction with ``rmdir`` (the reparse point itself). Neither form
+    resolves the entry's target.
+    """
+    try:
+        os.unlink(path)
+        return True
+    except OSError:
+        pass
+    try:
+        os.rmdir(path)
+        return True
+    except OSError:
+        return False
+
+
+def _clear_claimed_tree(claim_path: str) -> bool:
+    """Clear a privately-claimed directory and remove it; True when removed.
+
+    Every entry is claimed by rename before it is touched: subdirectories are
+    renamed to a private name INSIDE the claim (an entry-level rename can only
+    ever move a swapped-in link as a link), verified with ``lstat``, recursed
+    into only if they are still real directories, then removed with ``rmdir``.
+    Links are unlinked as entries and never entered. No operation here resolves
+    a name that was checked separately from its use.
+    """
+    try:
+        with os.scandir(claim_path) as it:
+            entries = list(it)
+    except OSError:
+        return False
+    for entry in entries:
+        full = os.path.join(claim_path, entry.name)
+        if _entry_is_link(entry):
+            _unlink_link_entry(full)
+            continue
+        if entry.is_dir(follow_symlinks=False):
+            sub = f"{full}.rm-claim.{os.getpid()}.{os.urandom(4).hex()}"
+            try:
+                os.rename(full, sub)
+            except OSError:
+                continue
+            try:
+                sub_st = os.lstat(sub)
+            except OSError:
+                continue
+            if stat.S_ISLNK(sub_st.st_mode) or _path_is_junction(sub):
+                _unlink_link_entry(sub)
+                continue
+            if not stat.S_ISDIR(sub_st.st_mode):
+                _unlink_link_entry(sub)
+                continue
+            _clear_claimed_tree(sub)
+            try:
+                os.rmdir(sub)
+            except OSError:
+                pass
+        else:
+            try:
+                os.unlink(full)
+            except OSError:
+                pass
+    try:
+        os.rmdir(claim_path)
+        return True
+    except OSError:
+        return False
 
 
 def _open_dir_no_follow(path: Path) -> int | None:
@@ -2680,10 +2870,14 @@ def sweep_run_journal(
         if not journal_root.exists():
             return counters
         journal_root_real = os.path.realpath(journal_root)
+        # Dot-prefixed entries are this module's own in-progress deletion
+        # debris (``.<sid>.delete-claim.*``); they are not sessions and must
+        # never be archived or swept as one.
         session_dirs = [
             entry
             for entry in sorted(journal_root.iterdir())
-            if not entry.is_symlink()
+            if not entry.name.startswith(".")
+            and not entry.is_symlink()
             and entry.is_dir()
             and _resolve_within(journal_root_real, entry)
         ]
