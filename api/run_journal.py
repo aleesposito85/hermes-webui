@@ -308,15 +308,68 @@ def _archive_path_for(live_path: Path) -> Path | None:
     )
 
 
-def _archive_read_allowed(archive_path: Path) -> bool:
-    """True when ``archive_path`` may be opened as journal data (fail closed).
+def _open_archive_entry(archive_path: Path) -> "os.fdopen | None":
+    """Open an archived run file through PINNED directory handles (fail closed).
 
-    Archive reads must stay inside the journal tree: the archive root and the
-    per-session directory must be real directories (never symlinks) that resolve
-    within the archive root, and the ``.jsonl.gz`` entry itself must be a real
-    regular file. Without this a symlinked ``_run_journal_archive/<sid>`` (or a
-    swapped entry) could make readers serve an arbitrary external file as
-    journal rows.
+    Path-based validation followed by ``gzip.open()`` on the same mutable
+    pathname is check-then-use: a swap of the entry (or of its session
+    directory) between the check and the open makes the open follow a symlink
+    out of ``_run_journal_archive`` and serve an external file as journal rows.
+
+    This opener closes that window by pinning everything it depends on:
+
+      * the archive root and the per-session directory are opened with
+        ``O_NOFOLLOW | O_DIRECTORY`` (a symlinked component is refused), and the
+        session handle is verified to live under the pinned root handle;
+      * the entry itself is opened with ``O_NOFOLLOW`` relative to the pinned
+        session handle, and must be a regular file.
+
+    Every subsequent read happens through those descriptors, so nothing a
+    concurrent actor does to the pathnames can redirect it. Returns a binary
+    file object (the caller closes it), or None when the archive is absent,
+    not contained, or cannot be pinned.
+    """
+    if not _DIR_FD_OK or not archive_path.name.endswith(".jsonl.gz"):
+        return None
+    if not _SAFE_ID_RE.fullmatch(archive_path.parent.name):
+        return None
+    archive_root = archive_path.parent.parent
+    root_fd = session_fd = entry_fd = None
+    try:
+        root_fd = os.open(str(archive_root), os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW)
+        session_fd = os.open(
+            archive_path.parent.name, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW, dir_fd=root_fd
+        )
+        # `session_fd` came from an openat against the pinned root handle, so it
+        # IS the root's child directory by construction — no path re-resolution
+        # happens anywhere below this point.
+        entry_fd = os.open(archive_path.name, os.O_RDONLY | _O_NOFOLLOW, dir_fd=session_fd)
+        st = os.fstat(entry_fd)
+        if not stat.S_ISREG(st.st_mode):
+            os.close(entry_fd)
+            return None
+        fh = os.fdopen(entry_fd, "rb")
+        entry_fd = None  # ownership handed to fh
+        return fh
+    except OSError:
+        return None
+    finally:
+        for fd in (entry_fd, session_fd, root_fd):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+
+def _archive_read_allowed(archive_path: Path) -> bool:
+    """True when ``archive_path`` is an archive entry inside the journal tree.
+
+    Pre-flight containment for callers that only need a cheap existence/typing
+    answer (discovery, listing). It is NOT sufficient on its own before a read:
+    a check here and an open later is check-then-use, so reads go through
+    :func:`_open_archive_entry`, which pins the whole path. Kept as a single
+    source of truth for "is this shaped like a contained archive entry".
     """
     archive_root = archive_path.parent.parent
     if not archive_path.name.endswith(".jsonl.gz"):
@@ -412,11 +465,14 @@ def _merge_archive_and_live_text(archive_text: str, live_text: str) -> str:
 
 
 def _read_gz_text(archive_path: Path) -> str | None:
-    if not _archive_read_allowed(archive_path):
+    """Read an archived run file, opening it through pinned handles (fail closed)."""
+    fh = _open_archive_entry(archive_path)
+    if fh is None:
         return None
     try:
-        with gzip.open(archive_path, "rt", encoding="utf-8") as fh:
-            return fh.read()
+        with fh:
+            with gzip.GzipFile(fileobj=fh, mode="rb") as gz:
+                return gz.read().decode("utf-8", errors="strict")
     except FileNotFoundError:
         return None
     except (OSError, EOFError, UnicodeDecodeError):
@@ -632,19 +688,25 @@ def _run_journal_file_bytes(path: Path):
     Raises FileNotFoundError when neither copy exists. The both-exist case is
     handled by the caller via :func:`_read_run_file_text` (it needs row-level
     merging); this opener is for streaming reads of a single copy. Archived
-    copies must pass :func:`_archive_read_allowed` (containment, fail closed).
+    copies are opened through pinned directory handles
+    (:func:`_open_archive_entry`) so a concurrent path swap cannot redirect the
+    read outside the archive tree.
     """
-    if path.suffix == ".gz":
-        if not _archive_read_allowed(path):
+    if path.suffix == ".gz" or path.name.endswith(".jsonl.gz"):
+        fh = _open_archive_entry(path)
+        if fh is None:
             raise FileNotFoundError(str(path))
-        return gzip.open(path, "rb")
+        return gzip.GzipFile(fileobj=fh, mode="rb")
     try:
         return path.open("rb")
     except FileNotFoundError:
         archived = _archive_path_for(path)
-        if archived is None or not _archive_read_allowed(archived):
+        if archived is None:
             raise
-        return gzip.open(archived, "rb")
+        fh = _open_archive_entry(archived)
+        if fh is None:
+            raise
+        return gzip.GzipFile(fileobj=fh, mode="rb")
 
 
 def _iter_bounded_raw_jsonl_lines(path: Path, *, max_bytes: int, retained_bytes: int = 0):

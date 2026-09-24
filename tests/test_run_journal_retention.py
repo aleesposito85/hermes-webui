@@ -590,6 +590,92 @@ def test_archive_read_falls_back_when_live_path_is_symlinked(tmp_path):
     assert summary is not None and summary.get("run_id") == "r1"
 
 
+def test_archive_read_race_does_not_leak_external_file(tmp_path, monkeypatch):
+    """A swap between the containment check and the open must not leak data.
+
+    Reproduces the review finding: `_archive_read_allowed` validated the path,
+    then `gzip.open()` re-resolved that mutable pathname — a symlink planted in
+    between made the read follow it out of the archive tree. Reads now open
+    through pinned directory handles (`O_NOFOLLOW` + `dir_fd`), so the swap
+    cannot redirect the read.
+    """
+    _write_run(tmp_path, "s1", "r1", mtime_age_days=30)
+    _sweep(tmp_path, ttl_days=14, max_runs_per_session=0, max_bytes_per_session=0)
+    archive = _archive_path(tmp_path, "s1", "r1")
+    assert archive.exists()
+
+    # External gzip with a sentinel payload, then the attacker's swap.
+    external = tmp_path.parent / "external-evil.jsonl.gz"
+    with gzip.open(external, "wb") as fh:
+        fh.write(_external_row_bytes("s1", "r1"))
+
+    real_open = rj._open_archive_entry
+    swap = {"done": False}
+
+    def open_with_swap(path):
+        if not swap["done"] and Path(path) == archive:
+            swap["done"] = True
+            archive.unlink()
+            archive.symlink_to(external)
+        return real_open(path)
+
+    monkeypatch.setattr(rj, "_open_archive_entry", open_with_swap)
+    text = rj._read_gz_text(archive)
+    monkeypatch.undo()
+
+    assert text is None or "EXTERNAL" not in text, "external file was served as archive data"
+
+
+def test_archive_read_race_via_run_events_does_not_leak(tmp_path, monkeypatch):
+    """The same swap must not leak through the read_run_events path either."""
+    _write_run(tmp_path, "s1", "r1", mtime_age_days=30)
+    _sweep(tmp_path, ttl_days=14, max_runs_per_session=0, max_bytes_per_session=0)
+    archive = _archive_path(tmp_path, "s1", "r1")
+
+    external = tmp_path.parent / "external-evil2.jsonl.gz"
+    with gzip.open(external, "wb") as fh:
+        fh.write(_external_row_bytes("s1", "r1"))
+
+    real_open = rj._open_archive_entry
+    swap = {"done": False}
+
+    def open_with_swap(path):
+        if not swap["done"] and Path(path) == archive:
+            swap["done"] = True
+            archive.unlink()
+            archive.symlink_to(external)
+        return real_open(path)
+
+    monkeypatch.setattr(rj, "_open_archive_entry", open_with_swap)
+    result = rj.read_run_events("s1", "r1", session_dir=tmp_path)
+    monkeypatch.undo()
+
+    payloads = [json.dumps(event.get("payload", {})) for event in result["events"]]
+    assert not any("EXTERNAL" in p for p in payloads)
+
+
+def _external_row_bytes(sid: str, rid: str) -> bytes:
+    return (
+        json.dumps(
+            {
+                "version": 1,
+                "event_id": f"{rid}:99",
+                "seq": 99,
+                "run_id": rid,
+                "session_id": sid,
+                "event": "token",
+                "type": "token",
+                "created_at": time.time(),
+                "terminal": True,
+                "terminal_state": "completed",
+                "payload": {"text": "EXTERNAL"},
+            },
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
 # ── pruning: a replacement archive must never be pruned ─────────────────────
 
 
