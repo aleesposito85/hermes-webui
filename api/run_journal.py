@@ -225,6 +225,21 @@ def _default_session_dir() -> Path:
     return Path(SESSION_DIR)
 
 
+def _dir_identity_matches(path: str | os.PathLike, identity: tuple[int, int]) -> bool:
+    """True when ``path`` still resolves to the recorded ``(st_dev, st_ino)``.
+
+    Used to verify a claim made by rename on platforms without pinned handles:
+    the rename resolves the parent pathname, so this second look proves whether
+    the claim landed in the directory the caller captured. A mismatch means a
+    swap occurred; callers restore the entry and fail closed.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    return (int(st.st_dev), int(st.st_ino)) == identity
+
+
 def _validate_id(value: str, field: str) -> str:
     cleaned = str(value or "").strip()
     if not cleaned or "/" in cleaned or "\\" in cleaned or not _SAFE_ID_RE.fullmatch(cleaned):
@@ -1569,7 +1584,11 @@ def _remove_session_tree_by_path(session_root: Path, session_id: str) -> bool:
         root_st = os.lstat(journal_root)
     except OSError:
         return False
-    if stat.S_ISLNK(root_st.st_mode) or not stat.S_ISDIR(root_st.st_mode):
+    if (
+        stat.S_ISLNK(root_st.st_mode)
+        or not stat.S_ISDIR(root_st.st_mode)
+        or _path_is_junction(journal_root)
+    ):
         return False
     root_identity = (int(root_st.st_dev), int(root_st.st_ino))
 
@@ -1578,7 +1597,10 @@ def _remove_session_tree_by_path(session_root: Path, session_id: str) -> bool:
     # 1. Finish debris left by an interrupted deletion of this same session.
     #    Debris is re-claimed with an atomic entry-level rename before it is
     #    touched, exactly like the live entry below, so no destructive step
-    #    ever resolves a separately-checked name.
+    #    ever resolves a separately-checked name. Each claim is then verified
+    #    against the root identity captured up front: the rename resolves the
+    #    root pathname, so a root swapped before it puts a FOREIGN entry under
+    #    our claim name — restore it and fail closed rather than clear it.
     try:
         with os.scandir(journal_root) as it:
             debris = [e.name for e in it if e.name.startswith(claim_prefix)]
@@ -1591,6 +1613,12 @@ def _remove_session_tree_by_path(session_root: Path, session_id: str) -> bool:
             os.rename(full, reclaimed)
         except OSError:
             continue
+        if not _dir_identity_matches(journal_root, root_identity):
+            try:
+                os.rename(reclaimed, full)
+            except OSError:
+                pass
+            return removed_any
         try:
             reclaimed_st = os.lstat(reclaimed)
         except OSError:
@@ -1619,13 +1647,9 @@ def _remove_session_tree_by_path(session_root: Path, session_id: str) -> bool:
         return removed_any
 
     # 3. Verify the claim landed where the check said it would. A parent swap
-    # between the identity capture and the claim would have moved a FOREIGN
-    # entry into our claim name; restore it and fail closed.
-    try:
-        parent_st = os.stat(journal_root)
-    except OSError:
-        return removed_any
-    if (int(parent_st.st_dev), int(parent_st.st_ino)) != root_identity:
+    #    between the identity capture and the claim would have moved a FOREIGN
+    #    entry into our claim name; restore it and fail closed.
+    if not _dir_identity_matches(journal_root, root_identity):
         try:
             os.rename(claim, os.path.join(str(journal_root), session_id))
         except OSError:
@@ -2160,6 +2184,19 @@ def _restore_prune_claim(claim: str, name: str, dir_fd: int) -> None:
             pass
     except OSError:
         logger.warning("Run-journal prune claim left in place (restore failed): %s", claim, exc_info=True)
+
+
+def _entry_exists_at(dir_fd: int, name: str) -> bool:
+    """True when ``name`` exists in the directory pinned by ``dir_fd``.
+
+    No-follow: a symlinked entry still counts as existing (the caller's rule is
+    "keep the archive while ANY live counterpart is present").
+    """
+    try:
+        os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        return True
+    except OSError:
+        return False
 
 
 def _unlink_archive_entry(name: str, dir_fd: int) -> bool:
@@ -2705,7 +2742,8 @@ def _fsync_dir_via_fd(dir_fd: int) -> bool:
 
 def _sweep_run_journal_session(
     session_root: Path,
-    session_journal_dir: Path,
+    journal_root_fd: int,
+    session_name: str,
     caps: dict,
     now: float,
     counters: dict,
@@ -2713,20 +2751,27 @@ def _sweep_run_journal_session(
 ) -> None:
     """Archive eligible runs inside one session's journal dir.
 
-    The session dir is PINNED as an open handle (``dir_fd``) for the whole pass,
-    so every stat, classification read, and move acts on the directory's inode —
-    a swap of the pathname to a symlink part-way through cannot redirect any of
-    them. Sessions that cannot be pinned are skipped (fail closed).
+    The session directory is opened RELATIVE to the pinned live-root handle
+    (``O_NOFOLLOW``), so neither a symlinked session entry nor a root pathname
+    swapped after the pin can redirect anything: the pass acts on the directory
+    the root handle names. Inside, every stat, classification read, and move is
+    fd-relative to the session handle, so a swap of any pathname part-way
+    through cannot redirect those either. Sessions that cannot be opened are
+    skipped (fail closed).
     """
-    session_fd = _open_dir_no_follow(session_journal_dir)
-    if session_fd is None:
+    try:
+        session_fd = os.open(
+            session_name, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW, dir_fd=journal_root_fd
+        )
+    except OSError:
         return
+    session_journal_dir = session_root / RUN_JOURNAL_DIR_NAME / session_name
     archive_fd = -1
     archive_root_fd = -1
     chain_synced = True
     try:
         archive_root_fd, archive_fd, chain_synced = _open_archive_dir(
-            session_root, session_journal_dir.name
+            session_root, session_name
         )
         _cleanup_archive_temps(archive_fd)
         _sweep_session_entries(
@@ -2763,6 +2808,13 @@ def _prune_run_journal_archive(session_root: Path, caps: dict, now: float, count
     ``O_NOFOLLOW``, and pruning happens fd-relatively inside that handle. A
     symlinked archive root or session directory therefore cannot make the prune
     delete files outside the journal tree.
+
+    An archive is pruned ONLY when its run has no live counterpart: the live
+    journal is append-only, so a run whose archive was written and then grew
+    again has a newer LIVE suffix whose seqs continue from the archived prefix.
+    Pruning that prefix would make the surviving rows noncontiguous and session
+    replay would fail with ``replay_noncontiguous``. The check and the prune
+    run under the run's writer lock, so an append cannot slip between them.
     """
     ttl_days = float(caps.get("archive_ttl_days") or 0.0)
     if ttl_days <= 0:
@@ -2771,6 +2823,7 @@ def _prune_run_journal_archive(session_root: Path, caps: dict, now: float, count
     if opened is None:
         return
     root_fd, _parent_synced = opened
+    live_root = session_root / RUN_JOURNAL_DIR_NAME
     try:
         try:
             names = sorted(os.listdir(root_fd))
@@ -2787,26 +2840,43 @@ def _prune_run_journal_archive(session_root: Path, caps: dict, now: float, count
                 )
             except OSError:
                 continue
+            # Pinned handle for the live counterpart of this session (None when
+            # the session has no live directory at all: every run is fully
+            # archived, so age-only pruning is safe).
+            live_session_fd = _open_dir_no_follow(live_root / name)
             try:
                 for entry in sorted(os.listdir(session_fd)):
                     if not entry.endswith(".jsonl.gz"):
                         continue
+                    run_stem = entry[: -len(".jsonl.gz")]
                     try:
                         st = os.stat(entry, dir_fd=session_fd, follow_symlinks=False)
                     except OSError:
                         continue
                     if float(st.st_mtime) >= cutoff:
                         continue
-                    # Identity is re-asserted inside the unlink (see
-                    # `_prune_archive_entry`): a name republished since the age
-                    # check must survive.
-                    if _prune_archive_entry(entry, st, session_fd):
-                        counters["pruned_archives"] += 1
+                    # Keep the archive while the run still has live rows: a
+                    # prefix must not be pruned out from under a live suffix.
+                    # The existence check and the prune share the writer lock
+                    # so an append cannot interleave between them.
+                    live_path = live_root / name / f"{run_stem}.jsonl"
+                    with _lock_for(live_path):
+                        if live_session_fd is not None and _entry_exists_at(
+                            live_session_fd, f"{run_stem}.jsonl"
+                        ):
+                            continue
+                        # Identity is re-asserted inside the unlink (see
+                        # `_prune_archive_entry`): a name republished since the
+                        # age check must survive.
+                        if _prune_archive_entry(entry, st, session_fd):
+                            counters["pruned_archives"] += 1
             finally:
-                try:
-                    os.close(session_fd)
-                except OSError:
-                    pass
+                for fd in (live_session_fd, session_fd):
+                    if fd is not None:
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            pass
     finally:
         try:
             os.close(root_fd)
@@ -2866,58 +2936,71 @@ def sweep_run_journal(
             "(pinned-directory moves unavailable)"
         )
         return counters
-    try:
-        if not journal_root.exists():
-            return counters
-        journal_root_real = os.path.realpath(journal_root)
-        # Dot-prefixed entries are this module's own in-progress deletion
-        # debris (``.<sid>.delete-claim.*``); they are not sessions and must
-        # never be archived or swept as one.
-        session_dirs = [
-            entry
-            for entry in sorted(journal_root.iterdir())
-            if not entry.name.startswith(".")
-            and not entry.is_symlink()
-            and entry.is_dir()
-            and _resolve_within(journal_root_real, entry)
-        ]
-    except OSError:
-        counters["errors"] += 1
+    # Pin the LIVE journal root with O_NOFOLLOW for the whole pass. Refusing a
+    # symlinked root matters: following one would sweep ANOTHER tree's journal
+    # (archiving its runs into this profile's archive and removing the foreign
+    # originals), and a root swapped part-way through cannot redirect anything
+    # because enumeration and every per-session open go through this handle.
+    journal_root_fd = _open_dir_no_follow(journal_root)
+    if journal_root_fd is None:
         return counters
-    sweep_now = time.time() if now is None else float(now)
-    budget = {"remaining": _RETENTION_ARCHIVE_BYTES_PER_SWEEP}
-    with _SWEEP_RUN_LOCK:
-        for session_journal_dir in session_dirs:
-            if not _SAFE_ID_RE.fullmatch(session_journal_dir.name):
-                continue
-            counters["sessions_scanned"] += 1
-            # Skip a session whose deletion is in flight: publishing an archive
-            # into it would race that deletion (and, if it landed after the
-            # deletion's final sweep of the directory, leave a recoverable
-            # transcript behind). Non-blocking, so the sweep never waits on a
-            # deletion either.
-            session_lock = _session_lock_for(root, session_journal_dir.name)
-            if not session_lock.acquire(blocking=False):
-                counters["skipped_files"] += 1
+    try:
+        try:
+            names = sorted(os.listdir(journal_root_fd))
+        except OSError:
+            counters["errors"] += 1
+            return counters
+        session_names: list[str] = []
+        for name in names:
+            # Dot-prefixed entries are this module's own in-progress deletion
+            # debris (``.<sid>.delete-claim.*``); they are not sessions and must
+            # never be archived or swept as one.
+            if name.startswith(".") or not _SAFE_ID_RE.fullmatch(name):
                 continue
             try:
-                _sweep_run_journal_session(
-                    root, session_journal_dir, caps, sweep_now, counters, budget
-                )
+                st = os.stat(name, dir_fd=journal_root_fd, follow_symlinks=False)
+            except OSError:
+                continue
+            if not stat.S_ISDIR(st.st_mode):
+                continue
+            session_names.append(name)
+        sweep_now = time.time() if now is None else float(now)
+        budget = {"remaining": _RETENTION_ARCHIVE_BYTES_PER_SWEEP}
+        with _SWEEP_RUN_LOCK:
+            for session_name in session_names:
+                counters["sessions_scanned"] += 1
+                # Skip a session whose deletion is in flight: publishing an
+                # archive into it would race that deletion (and, if it landed
+                # after the deletion's final sweep of the directory, leave a
+                # recoverable transcript behind). Non-blocking, so the sweep
+                # never waits on a deletion either.
+                session_lock = _session_lock_for(root, session_name)
+                if not session_lock.acquire(blocking=False):
+                    counters["skipped_files"] += 1
+                    continue
+                try:
+                    _sweep_run_journal_session(
+                        root, journal_root_fd, session_name, caps, sweep_now, counters, budget
+                    )
+                except Exception:
+                    counters["errors"] += 1
+                    logger.warning(
+                        "Run-journal retention sweep failed for session %s",
+                        session_name,
+                        exc_info=True,
+                    )
+                finally:
+                    session_lock.release()
+            try:
+                _prune_run_journal_archive(root, caps, sweep_now, counters)
             except Exception:
                 counters["errors"] += 1
-                logger.warning(
-                    "Run-journal retention sweep failed for %s",
-                    session_journal_dir,
-                    exc_info=True,
-                )
-            finally:
-                session_lock.release()
+                logger.warning("Run-journal archive prune failed", exc_info=True)
+    finally:
         try:
-            _prune_run_journal_archive(root, caps, sweep_now, counters)
-        except Exception:
-            counters["errors"] += 1
-            logger.warning("Run-journal archive prune failed", exc_info=True)
+            os.close(journal_root_fd)
+        except OSError:
+            pass
     if counters["archived_files"]:
         logger.info(
             "Run-journal retention archived %d file(s) / %d bytes across %d session(s)",
@@ -2926,21 +3009,6 @@ def sweep_run_journal(
             counters["sessions_scanned"],
         )
     return counters
-
-
-def _resolve_within(root_real: str, path: Path) -> bool:
-    """True when ``path``'s fully-resolved location stays inside ``root_real``.
-
-    Boundary-aware: a sibling directory whose name merely starts with the root's
-    prefix is not "inside" it.
-    """
-    try:
-        candidate = os.path.realpath(path)
-    except OSError:
-        return False
-    if candidate == root_real:
-        return True
-    return candidate.startswith(root_real + os.sep)
 
 
 def run_journal_sweep_enabled() -> bool:

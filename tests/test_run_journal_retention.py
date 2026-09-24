@@ -1119,6 +1119,173 @@ def test_fallback_deletion_finishes_a_claim_left_by_a_crash(tmp_path, monkeypatc
     assert not session_dir.exists()
 
 
+# ── sweep root containment (CORE 1) + no-pin root swap (CORE 2) ─────────────
+
+
+def test_sweep_does_not_follow_symlinked_journal_root(tmp_path):
+    """A symlinked ``_run_journal`` root must not be swept into another tree.
+
+    Reproduces the finding: the sweep resolved the root with ``realpath`` (which
+    hides the symlink) and enumerated through the pathname, so a root pointing
+    at another tree's journal had THAT tree's runs archived into the local
+    archive - the foreign original was removed and its owner could read zero
+    events. The root is now opened with ``O_NOFOLLOW`` and everything enumerates
+    through the pinned handle; a root that is not a real directory is refused.
+    """
+    victim_root = tmp_path / "victim" / "sessions"
+    victim = _write_run(victim_root, "sess-vic", "runvic", mtime_age_days=40)
+    sweeper = tmp_path / "sweeper" / "sessions"
+    sweeper.mkdir(parents=True)
+    (sweeper / rj.RUN_JOURNAL_DIR_NAME).symlink_to(
+        victim_root / rj.RUN_JOURNAL_DIR_NAME, target_is_directory=True
+    )
+
+    counters = _sweep(sweeper, ttl_days=7, max_runs_per_session=0, max_bytes_per_session=0)
+
+    assert victim.exists(), "the sweep archived a foreign tree's run"
+    assert counters["archived_files"] == 0
+    assert not _archive_path(sweeper, "sess-vic", "runvic").exists()
+
+
+def test_sweep_root_swap_mid_pass_stays_handle_relative(tmp_path, monkeypatch):
+    """A root pathname swapped mid-pass cannot redirect the sweep.
+
+    The root is pinned BEFORE enumeration; after the swap the pass must still
+    operate on the original directory (its inode) - archiving ITS runs - and
+    never touch the tree the pathname now points at. On the pre-fix code the
+    per-session open went through the pathname, so the swapped-in tree's run was
+    archived and its original removed.
+    """
+    path = _write_run(tmp_path, "s1", "r1", mtime_age_days=30)
+    original_rows = path.read_text(encoding="utf-8")
+    journal_root = tmp_path / rj.RUN_JOURNAL_DIR_NAME
+
+    foreign_journal = tmp_path.parent / f"{tmp_path.name}-foreign-journal"
+    (foreign_journal / "s1").mkdir(parents=True)
+    foreign_run = foreign_journal / "s1" / "r2.jsonl"
+    foreign_rows = original_rows.replace('"r1"', '"r2"').replace("r1:", "r2:")
+    foreign_run.write_text(foreign_rows, encoding="utf-8")
+    old = time.time() - 40 * 86400
+    os.utime(foreign_run, (old, old))
+
+    real_sweep_session = rj._sweep_run_journal_session
+    state = {"swapped": False}
+
+    def swap_then_sweep(*args, **kwargs):
+        if not state["swapped"]:
+            state["swapped"] = True
+            os.rename(journal_root, tmp_path / "_run_journal-real-saved")
+            journal_root.symlink_to(foreign_journal, target_is_directory=True)
+        return real_sweep_session(*args, **kwargs)
+
+    monkeypatch.setattr(rj, "_sweep_run_journal_session", swap_then_sweep)
+
+    _sweep(tmp_path, ttl_days=14, max_runs_per_session=0, max_bytes_per_session=0)
+
+    assert state["swapped"], "test did not trigger the swap"
+    assert foreign_run.exists(), "the sweep followed the swapped-in root"
+    assert not _archive_path(tmp_path, "s1", "r2").exists()
+    assert _archive_path(tmp_path, "s1", "r1").exists(), (
+        "the pass did not operate on the pinned original directory"
+    )
+
+
+def test_fallback_deletion_root_swap_restores_entry_and_fails_closed(tmp_path, monkeypatch):
+    """A root swapped mid-fallback must not destroy foreign files.
+
+    Reproduces the finding: the no-pin fallback lstat-checked the root and then
+    the debris scan walked the pathname again; when a root was swapped in
+    between, its debris-shaped entries were deleted while the deletion still
+    reported success. Every claim is now identity-verified against the root
+    captured before it, and a mismatch restores the entry and fails closed.
+    """
+    _write_run(tmp_path, "s1", "r1", mtime_age_days=0)
+    journal_root = tmp_path / rj.RUN_JOURNAL_DIR_NAME
+
+    foreign = tmp_path.parent / f"{tmp_path.name}-foreign-delete"
+    debris = foreign / ".s1.delete-claim.999.cafebabe"
+    debris.mkdir(parents=True)
+    precious = debris / "PRECIOUS.txt"
+    precious.write_text("must survive", encoding="utf-8")
+    (foreign / "s1").mkdir()
+
+    real_scandir = os.scandir
+    state = {"swapped": False}
+
+    def swapping_scandir(path, *args, **kwargs):
+        if not state["swapped"] and str(path) == str(journal_root):
+            state["swapped"] = True
+            os.rename(journal_root, tmp_path / "_run_journal-real-saved")
+            journal_root.symlink_to(foreign, target_is_directory=True)
+        return real_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(rj, "_DIR_FD_OK", False)
+    monkeypatch.setattr(rj, "_open_dir_no_follow", lambda _p: None)
+    monkeypatch.setattr(os, "scandir", swapping_scandir)
+
+    result = rj.delete_run_journal("s1", session_dir=tmp_path)
+
+    assert state["swapped"], "test did not trigger the swap"
+    assert precious.exists(), "the fallback destroyed a foreign entry"
+    assert result is False, "deletion falsely reported success after a root swap"
+
+
+# ── TTL pruning must not orphan a run's live suffix (CORE 3) ────────────────
+
+
+def test_archive_prune_keeps_archive_while_live_suffix_exists(tmp_path, monkeypatch):
+    """TTL must not prune a prefix while the same run still has live rows.
+
+    Reproduces the finding: with archive TTL enabled, an aged ``.jsonl.gz`` was
+    pruned by age alone even though a NEWER live suffix existed for the same run
+    id; event reads silently lost the prefix and session replay went
+    ``replay_noncontiguous``. The prune now keeps any archive whose live
+    counterpart exists (checked under the run's writer lock).
+    """
+    sid, rid = "s1", "r1"
+    archive_dir = tmp_path / rj.RUN_JOURNAL_ARCHIVE_DIR_NAME / sid
+    archive_dir.mkdir(parents=True)
+
+    def _row(seq, name, terminal=False):
+        return {
+            "version": 1, "event_id": f"{rid}:{seq}", "seq": seq, "run_id": rid,
+            "session_id": sid, "event": name, "type": name,
+            "created_at": time.time() - 3600, "terminal": terminal,
+            "terminal_state": "completed" if terminal else None,
+            "payload": {"terminal_state": "completed"} if terminal else {"text": "x"},
+        }
+
+    # Archived prefix: seq 1 only, well past the 30-day archive TTL.
+    archive = archive_dir / f"{rid}.jsonl.gz"
+    with gzip.open(archive, "wb") as gz:
+        gz.write((json.dumps(_row(1, "token"), separators=(",", ":")) + "\n").encode())
+    old = time.time() - 400 * 86400
+    os.utime(archive, (old, old))
+
+    # Live suffix: seqs 2 + 3, freshly written (below every archival cap).
+    live_dir = tmp_path / rj.RUN_JOURNAL_DIR_NAME / sid
+    live_dir.mkdir(parents=True)
+    live = live_dir / f"{rid}.jsonl"
+    live.write_text(
+        json.dumps(_row(2, "token"), separators=(",", ":")) + "\n"
+        + json.dumps(_row(3, "done", True), separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv(rj._RETENTION_ARCHIVE_TTL_ENV, "30")
+    counters = _sweep(tmp_path, ttl_days=0, max_runs_per_session=0, max_bytes_per_session=0)
+
+    assert archive.exists(), "TTL pruned the prefix while the live suffix was present"
+    assert counters["pruned_archives"] == 0
+    # Reads stay complete across the archive + live union.
+    read = rj.read_run_events(sid, rid, session_dir=tmp_path)
+    assert [int(e["seq"]) for e in read["events"]] == [1, 2, 3]
+    # SSE replay from the archived prefix stays contiguous.
+    replay = rj.read_session_run_events(sid, after_event_id=f"{rid}:1", session_dir=tmp_path)
+    assert replay["status"] == "ok", replay["status"]
+    assert [int(e["seq"]) for e in replay["events"]] == [2, 3]
+
+
 # ── ownership: the pinned raw handle must close on every exit path ──────────
 
 
