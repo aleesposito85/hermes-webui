@@ -1233,6 +1233,38 @@ def test_fallback_deletion_root_swap_restores_entry_and_fails_closed(tmp_path, m
 # ── TTL pruning must not orphan a run's live suffix (CORE 3) ────────────────
 
 
+def test_prune_preserves_archives_when_live_session_is_uninspectable(tmp_path, monkeypatch):
+    """An un-openable live session must keep its archives (fail closed).
+
+    Reproduces the finding: when the live session entry exists but cannot be
+    opened (swapped to a symlink, or unreadable), the prune treated it like an
+    ABSENT directory, bypassed the only live-counterpart check, and unlinked an
+    aged archive whose run may still have a live suffix. An unknown live state
+    must preserve the archive instead.
+    """
+    sid, rid = "s1", "r1"
+    archive_dir = tmp_path / rj.RUN_JOURNAL_ARCHIVE_DIR_NAME / sid
+    archive_dir.mkdir(parents=True)
+    archive = archive_dir / f"{rid}.jsonl.gz"
+    with gzip.open(archive, "wb") as gz:
+        gz.write(b'{"version":1}\n')
+    old = time.time() - 400 * 86400
+    os.utime(archive, (old, old))
+
+    # Live session replaced by a symlink: exists, but not openable.
+    live_root = tmp_path / rj.RUN_JOURNAL_DIR_NAME
+    live_root.mkdir(parents=True)
+    elsewhere = tmp_path.parent / f"{tmp_path.name}-elsewhere"
+    elsewhere.mkdir()
+    (live_root / sid).symlink_to(elsewhere, target_is_directory=True)
+
+    monkeypatch.setenv(rj._RETENTION_ARCHIVE_TTL_ENV, "30")
+    counters = _sweep(tmp_path, ttl_days=0, max_runs_per_session=0, max_bytes_per_session=0)
+
+    assert archive.exists(), "an un-inspectable live session let the prune delete the archive"
+    assert counters["pruned_archives"] == 0
+
+
 def test_prune_live_check_is_not_redirected_by_swapped_live_root(tmp_path, monkeypatch):
     """The live-counterpart check must not resolve the mutable live-root pathname.
 

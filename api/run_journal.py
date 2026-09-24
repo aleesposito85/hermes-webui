@@ -2864,19 +2864,32 @@ def _prune_run_journal_archive(session_root: Path, caps: dict, now: float, count
             except OSError:
                 continue
             # Pinned handle for the live counterpart of this session, opened
-            # RELATIVE to the pinned live root (None when the session has no
-            # live directory at all: every run is fully archived, so age-only
-            # pruning is safe). A symlinked session entry is refused (openat
-            # O_NOFOLLOW), which keeps pruning closed rather than redirected.
+            # RELATIVE to the pinned live root. Three outcomes:
+            #   * open succeeds    -> check the run's live entry below;
+            #   * ENOENT           -> the session has no live directory at all
+            #                         (every run fully archived): age-only
+            #                         pruning is safe;
+            #   * any other error  -> the live state is UNKNOWN (a symlinked
+            #                         or unreadable entry): preserve every
+            #                         archive for this session (fail closed),
+            #                         because this check is the only thing
+            #                         protecting prefix+live pairs.
             live_session_fd = None
+            live_session_unknown = False
             if live_root_fd >= 0:
                 try:
                     live_session_fd = os.open(
                         name, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW, dir_fd=live_root_fd
                     )
-                except OSError:
+                except FileNotFoundError:
                     live_session_fd = None
+                except OSError:
+                    live_session_unknown = True
             try:
+                if live_session_unknown:
+                    # The session's live state cannot be established: keep
+                    # every archive for it (fail closed).
+                    continue
                 for entry in sorted(os.listdir(session_fd)):
                     if not entry.endswith(".jsonl.gz"):
                         continue
