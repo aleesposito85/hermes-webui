@@ -1327,16 +1327,24 @@ def delete_run_journal(session_id: str, *, session_dir: Path | None = None) -> b
         return False
     root = Path(session_dir) if session_dir is not None else _default_session_dir()
     session_journal_dir = root / RUN_JOURNAL_DIR_NAME / sid
-    # Remove the session's archives through PINNED, no-follow handles: a
-    # symlinked `_run_journal_archive` (or a symlinked session dir inside it)
-    # would otherwise make this delete a foreign directory. When the handles
-    # cannot be acquired, nothing inside that root is trusted, so the archive
-    # side is left alone and only the live journal is removed.
-    _remove_archive_session_tree(root, sid)
-    if not session_journal_dir.exists():
-        return False
-    shutil.rmtree(session_journal_dir, ignore_errors=True)
-    removed = not session_journal_dir.exists()
+    # Serialize with the retention sweep. Archive publication and session
+    # deletion have no other shared lock: without this, a sweep can publish an
+    # archive AFTER this deletion's listing snapshot, and the (suppressed)
+    # final rmdir then fails on the non-empty directory — leaving a recoverable
+    # transcript behind after the session was deleted. Held across BOTH the
+    # archive removal and the live-directory removal so a sweep cannot interleave
+    # a publication anywhere inside the deletion.
+    with _SWEEP_RUN_LOCK:
+        # Remove the session's archives through PINNED, no-follow handles: a
+        # symlinked `_run_journal_archive` (or a symlinked session dir inside it)
+        # would otherwise make this delete a foreign directory. When the handles
+        # cannot be acquired, nothing inside that root is trusted, so the archive
+        # side is left alone and only the live journal is removed.
+        _remove_archive_session_tree(root, sid)
+        if not session_journal_dir.exists():
+            return False
+        shutil.rmtree(session_journal_dir, ignore_errors=True)
+        removed = not session_journal_dir.exists()
     # Evict any writer locks the removed runs left behind. `_lock_for` keys are
     # ``(str(path.parent), path.name, pid)`` and every run file for this session
     # lives directly under ``session_journal_dir``, so drop all keys whose parent
@@ -1396,9 +1404,10 @@ def _remove_archive_session_tree(session_root: Path, session_id: str) -> None:
     transcripts), so a missing/unguarded handle is not fatal: it means there is
     no trusted archive directory to clear.
     """
-    root_fd = _open_archive_root_no_follow(session_root)
-    if root_fd is None:
+    opened = _open_archive_root_no_follow(session_root)
+    if opened is None:
         return
+    root_fd, _parent_synced = opened
     session_fd = None
     try:
         try:
@@ -1438,56 +1447,69 @@ def _open_dir_no_follow(path: Path) -> int | None:
         return None
 
 
-def _remove_dir_tree(dir_fd: int) -> bool:
+def _remove_dir_tree(dir_fd: int, *, attempts: int = 3) -> bool:
     """Recursively remove a directory's contents via fd-relative operations.
 
     Used by ``delete_run_journal`` to clear a session's archive directory: every
     entry is listed/stat'ed/unlinked relative to ``dir_fd`` and subdirectories
     are recursed through ``O_NOFOLLOW`` handles, so nothing a concurrent actor
     does to the pathnames can redirect the deletion outside the pinned tree.
-    Symlinked entries are unlinked as links (never followed). Returns True when
-    the directory itself was removed.
+    Symlinked entries are unlinked as links (never followed).
+
+    The listing is repeated until the directory comes back EMPTY (bounded by
+    ``attempts``), so an entry published between the listing and the final
+    rmdir — the check-then-use shape this deletion must not have — is caught by
+    the next pass instead of leaving a recoverable transcript behind. Returns
+    True when the directory ended up empty.
     """
-    try:
-        names = sorted(os.listdir(dir_fd))
-    except OSError:
-        return False
-    for name in names:
+    for _ in range(max(1, attempts)):
         try:
-            st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            names = sorted(os.listdir(dir_fd))
         except OSError:
-            continue
-        if stat.S_ISDIR(st.st_mode):
-            sub_fd = None
+            return False
+        if not names:
+            return True
+        for name in names:
             try:
-                sub_fd = os.open(name, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW, dir_fd=dir_fd)
+                st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
             except OSError:
-                # Symlinked or unopenable "directory": unlink the entry itself.
+                continue
+            if stat.S_ISDIR(st.st_mode):
+                sub_fd = None
+                try:
+                    sub_fd = os.open(
+                        name, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW, dir_fd=dir_fd
+                    )
+                except OSError:
+                    # Symlinked or unopenable "directory": unlink the entry itself.
+                    try:
+                        os.unlink(name, dir_fd=dir_fd)
+                    except OSError:
+                        pass
+                    continue
+                try:
+                    _remove_dir_tree(sub_fd, attempts=attempts)
+                finally:
+                    try:
+                        os.close(sub_fd)
+                    except OSError:
+                        pass
+                try:
+                    os.rmdir(name, dir_fd=dir_fd)
+                except OSError:
+                    pass
+            else:
                 try:
                     os.unlink(name, dir_fd=dir_fd)
                 except OSError:
                     pass
-                continue
-            try:
-                _remove_dir_tree(sub_fd)
-            finally:
-                try:
-                    os.close(sub_fd)
-                except OSError:
-                    pass
-            try:
-                os.rmdir(name, dir_fd=dir_fd)
-            except OSError:
-                pass
-        else:
-            try:
-                os.unlink(name, dir_fd=dir_fd)
-            except OSError:
-                pass
-    return True
+    try:
+        return not os.listdir(dir_fd)
+    except OSError:
+        return False
 
 
-def _open_archive_root_no_follow(session_root: Path, *, create: bool = False) -> int | None:
+def _open_archive_root_no_follow(session_root: Path, *, create: bool = False) -> tuple[int, bool] | None:
     """Open the ARCHIVE ROOT as a pinned handle, refusing symlinked roots.
 
     Every archive operation that writes, deletes, or prunes must be relative to
@@ -1497,22 +1519,35 @@ def _open_archive_root_no_follow(session_root: Path, *, create: bool = False) ->
     then the (correctly) containment-checked readers could not find it, and
     ``delete_run_journal``/pruning would remove foreign files.
 
+    Returns ``(fd, parent_synced)``. ``parent_synced`` reports whether the
+    PARENT of a freshly created root was fsynced: a new directory's NAME is only
+    durable once its parent is synced, so the caller's durability gate must fold
+    this in before it may drop a live file (a crash could otherwise lose the
+    root's directory entry and the whole subtree beneath it). ``True`` when the
+    root already existed (nothing new to sync) or the sync succeeded.
+
     ``create=True`` best-effort creates the root first (mkdir of a symlink entry
-    fails harmlessly) and syncs its parent so the new directory entry survives a
-    crash. Returns a pinned fd, or None when the root is missing
-    (``create=False``), is not a real directory, or cannot be pinned. Callers
-    fail closed on None.
+    fails harmlessly). Returns None when the root is missing (``create=False``),
+    is not a real directory, or cannot be pinned. Callers fail closed on None.
     """
     archive_root = _archive_dir(session_root)
+    created = False
     if create:
+        existed = archive_root.exists() and not archive_root.is_symlink()
         try:
             archive_root.mkdir(parents=True, exist_ok=True)
+            created = not existed
         except OSError:
             pass
-        _fsync_dir_by_path(archive_root.parent)
     if archive_root.is_symlink():
         return None
-    return _open_dir_no_follow(archive_root)
+    fd = _open_dir_no_follow(archive_root)
+    if fd is None:
+        return None
+    parent_synced = True
+    if created:
+        parent_synced = _fsync_dir_by_path(archive_root.parent)
+    return fd, parent_synced
 
 
 def _fsync_dir_by_path(path: Path) -> bool:
@@ -1567,9 +1602,10 @@ def _open_archive_session_dir_no_follow(session_root: Path, session_id: str, *, 
     is opened RELATIVE to the pinned root handle (openat), so it is the root's
     child by construction. Returns None when either component is untrustworthy.
     """
-    root_fd = _open_archive_root_no_follow(session_root, create=create)
-    if root_fd is None:
+    opened = _open_archive_root_no_follow(session_root, create=create)
+    if opened is None:
         return None
+    root_fd, _parent_synced = opened
     session_fd = None
     try:
         if create:
@@ -1601,6 +1637,7 @@ def _archive_run_file(
     expected_signature: tuple[int, int, int, int, int],
     *,
     archive_root_fd: int = -1,
+    chain_synced_before: bool = True,
 ) -> int:
     """Compress ``source_path`` into ``archive_path`` and drop the live file.
 
@@ -1708,7 +1745,7 @@ def _archive_run_file(
         # crash too. Failure here is NOT fatal for the same reason as above —
         # the entry itself is already synced — but the newly created parent may
         # not be, so treat it like the entry-level failure and keep the live file.
-        if not _fsync_archive_dir_chain(archive_fd, archive_root_fd):
+        if not chain_synced_before or not _fsync_archive_dir_chain(archive_fd, archive_root_fd):
             logger.warning(
                 "Run-journal archive directory fsync failed for %s; keeping the live file",
                 archive_path,
@@ -2153,6 +2190,7 @@ def _sweep_session_entries(
     budget: dict,
     *,
     archive_root_fd: int = -1,
+    chain_synced_before: bool = True,
 ) -> None:
     """Body of one session sweep; every operation is fd-relative to ``session_fd``.
 
@@ -2225,6 +2263,7 @@ def _sweep_session_entries(
                         age_seconds,
                         budget,
                         archive_root_fd=archive_root_fd,
+                        chain_synced_before=chain_synced_before,
                     )
         if not archived:
             # Everything that stays live — including a run that could not be
@@ -2245,8 +2284,15 @@ def _try_archive_entry(
     budget: dict,
     *,
     archive_root_fd: int = -1,
+    chain_synced_before: bool = True,
 ) -> bool:
-    """Attempt to archive one eligible run; True when it was archived."""
+    """Attempt to archive one eligible run; True when it was archived.
+
+    ``chain_synced_before`` is False when the archive root/session directory was
+    freshly created but its parent could not be synced: the durability gate then
+    keeps the live file, because the new directory NAME (and everything under it)
+    could vanish across a crash.
+    """
     try:
         file_fd = os.open(name, os.O_RDONLY | _O_NOFOLLOW, dir_fd=session_fd)
     except OSError:
@@ -2276,6 +2322,7 @@ def _try_archive_entry(
             archive_fd,
             _stat_signature(st),
             archive_root_fd=archive_root_fd,
+            chain_synced_before=chain_synced_before,
         )
         if archived_bytes > 0:
             # Cached summary keyed on the (now gone) live file is stale; drop it
@@ -2306,28 +2353,44 @@ def _open_archive_dir(session_root: Path, session_id: str) -> tuple[int, int]:
     ``_run_journal_archive`` cannot make the sweep move a run out of the journal
     tree — where the containment-checked readers would then refuse it and
     recovery would silently see no events. The root handle is returned too so the
-    durability gate can sync the whole directory chain that leads to a new entry.
+    durability gate can sync the whole directory chain that leads to a new entry,
+    together with ``parent_synced``: False means the root was freshly created but
+    its PARENT (``sessions/``) could not be synced, so the gate must keep the
+    live file until that name is durable.
 
     Raises OSError when it cannot be pinned; the caller treats that as
     "skip this run" (fail closed).
     """
-    root_fd = _open_archive_root_no_follow(session_root, create=True)
-    if root_fd is None:
+    opened = _open_archive_root_no_follow(session_root, create=True)
+    if opened is None:
         raise OSError("cannot open archive root")
+    root_fd, parent_synced = opened
     session_fd = None
     try:
+        session_created = False
         try:
             os.mkdir(session_id, 0o700, dir_fd=root_fd)
+            session_created = True
         except OSError:
             pass
         session_fd = os.open(session_id, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW, dir_fd=root_fd)
-        return root_fd, session_fd
+        return root_fd, session_fd, (parent_synced and (not session_created or _fsync_dir_via_fd(root_fd)))
     except OSError:
         try:
             os.close(root_fd)
         except OSError:
             pass
         raise OSError(f"cannot open archive dir for session {session_id}") from None
+
+
+def _fsync_dir_via_fd(dir_fd: int) -> bool:
+    """fsync an already-pinned directory handle; False on failure."""
+    try:
+        os.fsync(dir_fd)
+        return True
+    except OSError:
+        logger.debug("Run-journal directory fsync failed (fd %s)", dir_fd, exc_info=True)
+        return False
 
 
 def _sweep_run_journal_session(
@@ -2350,8 +2413,11 @@ def _sweep_run_journal_session(
         return
     archive_fd = -1
     archive_root_fd = -1
+    chain_synced = True
     try:
-        archive_root_fd, archive_fd = _open_archive_dir(session_root, session_journal_dir.name)
+        archive_root_fd, archive_fd, chain_synced = _open_archive_dir(
+            session_root, session_journal_dir.name
+        )
         _cleanup_archive_temps(archive_fd)
         _sweep_session_entries(
             session_root,
@@ -2363,6 +2429,7 @@ def _sweep_run_journal_session(
             counters,
             budget,
             archive_root_fd=archive_root_fd,
+            chain_synced_before=chain_synced,
         )
     except OSError:
         pass
@@ -2390,9 +2457,10 @@ def _prune_run_journal_archive(session_root: Path, caps: dict, now: float, count
     ttl_days = float(caps.get("archive_ttl_days") or 0.0)
     if ttl_days <= 0:
         return
-    root_fd = _open_archive_root_no_follow(session_root)
-    if root_fd is None:
+    opened = _open_archive_root_no_follow(session_root)
+    if opened is None:
         return
+    root_fd, _parent_synced = opened
     try:
         try:
             names = sorted(os.listdir(root_fd))

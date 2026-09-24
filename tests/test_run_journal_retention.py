@@ -799,6 +799,74 @@ def test_failed_archive_dir_fsync_keeps_live_file(tmp_path, monkeypatch):
     assert len(events["events"]) > 0
 
 
+# ── late publication / un-synced root must not lose or strand data ──────────
+
+
+def test_delete_removes_archive_published_during_deletion(tmp_path, monkeypatch):
+    """A publication racing the deletion must not survive it.
+
+    Reproduces the finding: deletion listed the archive directory once, so an
+    entry published after that snapshot was not seen, the final rmdir failed on
+    the non-empty directory, and the error was suppressed — leaving a recoverable
+    transcript behind after the session was deleted.
+    """
+    _write_run(tmp_path, "s1", "r1", mtime_age_days=30)
+    _sweep(tmp_path, ttl_days=14, max_runs_per_session=0, max_bytes_per_session=0)
+    arch_dir = tmp_path / rj.RUN_JOURNAL_ARCHIVE_DIR_NAME / "s1"
+    assert arch_dir.is_dir()
+
+    real_listdir = os.listdir
+    state = {"fired": False}
+
+    def listdir_publishing_late(fd):
+        names = real_listdir(fd)
+        if not state["fired"]:
+            state["fired"] = True
+            with gzip.open(arch_dir / "late.jsonl.gz", "wb") as fh:
+                fh.write(b"late publication")
+        return names
+
+    monkeypatch.setattr(rj.os, "listdir", listdir_publishing_late)
+    rj.delete_run_journal("s1", session_dir=tmp_path)
+    monkeypatch.undo()
+
+    assert state["fired"], "the race was never injected"
+    survivors = [p for p in arch_dir.rglob("*")] if arch_dir.exists() else []
+    assert survivors == [], f"recoverable transcript left behind: {survivors}"
+
+
+def test_un_synced_new_archive_root_keeps_live_file(tmp_path, monkeypatch):
+    """A freshly created archive root whose PARENT cannot be synced keeps the live file.
+
+    Reproduces the finding: the parent fsync that makes a new
+    ``_run_journal_archive`` name durable was ignored, so a crash after the live
+    unlink could lose the root's directory entry and its whole subtree —
+    including the run's only remaining copy.
+    """
+    path = _write_run(tmp_path, "s1", "r1", mtime_age_days=30)
+    # tmp_path itself plays the parent of a root that does not exist yet.
+    parent_ino = os.stat(tmp_path).st_ino
+
+    real_fsync = os.fsync
+
+    def fail_parent_fsync(fd):
+        st = os.fstat(fd)
+        import stat as _stat
+
+        if _stat.S_ISDIR(st.st_mode) and st.st_ino == parent_ino:
+            raise OSError("injected parent-of-root fsync failure")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(rj.os, "fsync", fail_parent_fsync)
+    counters = _sweep(tmp_path, ttl_days=14, max_runs_per_session=0, max_bytes_per_session=0)
+    monkeypatch.undo()
+
+    assert path.exists(), "live file removed although the new root's name was never synced"
+    assert counters["archived_files"] == 0
+    events = rj.read_run_events("s1", "r1", session_dir=tmp_path)
+    assert len(events["events"]) > 0
+
+
 # ── ownership: the pinned raw handle must close on every exit path ──────────
 
 
