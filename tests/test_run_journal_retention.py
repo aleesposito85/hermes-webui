@@ -678,6 +678,127 @@ def _external_row_bytes(sid: str, rid: str) -> bytes:
     ).encode("utf-8")
 
 
+# ── archive root must never be followed (sweep / delete / prune) ────────────
+
+
+def _symlink_archive_root(root: Path, external: Path) -> None:
+    """Point ``_run_journal_archive`` at an EXTERNAL directory (symlink root)."""
+    external.mkdir(parents=True, exist_ok=True)
+    (root / rj.RUN_JOURNAL_ARCHIVE_DIR_NAME).symlink_to(external, target_is_directory=True)
+
+
+def test_sweep_skips_archival_when_archive_root_is_symlinked(tmp_path):
+    """A symlinked archive ROOT must not receive archives or lose the live file.
+
+    Following it would move the run outside the journal tree — where the
+    (correctly) containment-checked readers refuse it — so recovery would
+    silently see zero events for a run whose live file was removed.
+    """
+    path = _write_run(tmp_path, "s1", "r1", mtime_age_days=30)
+    external = tmp_path.parent / f"{tmp_path.name}-external-root"
+    _symlink_archive_root(tmp_path, external)
+
+    counters = _sweep(tmp_path, ttl_days=14, max_runs_per_session=0, max_bytes_per_session=0)
+
+    assert counters["archived_files"] == 0, "archived into a symlinked root"
+    assert path.exists(), "live file removed although the archive root was untrusted"
+    assert list(external.rglob("*.jsonl.gz")) == [], "files written into the external dir"
+    # Recovery still works: the run is live and fully readable.
+    events = rj.read_run_events("s1", "r1", session_dir=tmp_path)
+    assert len(events["events"]) > 0
+
+
+def test_delete_run_journal_does_not_follow_symlinked_archive_root(tmp_path):
+    """Session deletion must not remove a foreign directory via a symlinked root."""
+    _write_run(tmp_path, "s1", "r1", mtime_age_days=30)
+    external = tmp_path.parent / f"{tmp_path.name}-external-del"
+    (external / "s1").mkdir(parents=True)
+    precious = external / "s1" / "PRECIOUS.txt"
+    precious.write_text("must survive", encoding="utf-8")
+    _symlink_archive_root(tmp_path, external)
+
+    rj.delete_run_journal("s1", session_dir=tmp_path)
+
+    assert precious.exists(), "external file deleted through a symlinked archive root"
+    assert (external / "s1").is_dir()
+
+
+def test_prune_does_not_follow_symlinked_archive_root(tmp_path, monkeypatch):
+    """Archive pruning must not delete files outside the journal tree."""
+    _write_run(tmp_path, "s1", "keep", mtime_age_days=0)
+    external = tmp_path.parent / f"{tmp_path.name}-external-prune"
+    (external / "s1").mkdir(parents=True)
+    victim = external / "s1" / "victim.jsonl.gz"
+    with gzip.open(victim, "wb") as fh:
+        fh.write(b'{"version":1}\n')
+    old = time.time() - 400 * 86400
+    os.utime(victim, (old, old))
+    _symlink_archive_root(tmp_path, external)
+
+    monkeypatch.setenv(rj._RETENTION_ARCHIVE_TTL_ENV, "90")
+    counters = _sweep(tmp_path, ttl_days=0, max_runs_per_session=0, max_bytes_per_session=0)
+    monkeypatch.undo()
+
+    assert counters["pruned_archives"] == 0
+    assert victim.exists(), "external archive pruned through a symlinked root"
+
+
+def test_prune_skips_symlinked_session_dir_inside_real_root(tmp_path, monkeypatch):
+    """A symlinked SESSION dir inside a real archive root is not pruned through."""
+    _write_run(tmp_path, "s1", "keep", mtime_age_days=0)
+    external = tmp_path.parent / f"{tmp_path.name}-external-session"
+    external.mkdir(parents=True, exist_ok=True)
+    victim = external / "victim.jsonl.gz"
+    with gzip.open(victim, "wb") as fh:
+        fh.write(b'{"version":1}\n')
+    old = time.time() - 400 * 86400
+    os.utime(victim, (old, old))
+    archive_root = tmp_path / rj.RUN_JOURNAL_ARCHIVE_DIR_NAME
+    archive_root.mkdir(parents=True, exist_ok=True)
+    (archive_root / "s2").symlink_to(external, target_is_directory=True)
+
+    monkeypatch.setenv(rj._RETENTION_ARCHIVE_TTL_ENV, "90")
+    counters = _sweep(tmp_path, ttl_days=0, max_runs_per_session=0, max_bytes_per_session=0)
+    monkeypatch.undo()
+
+    assert counters["pruned_archives"] == 0
+    assert victim.exists(), "pruned through a symlinked session dir"
+
+
+# ── durability: a failed fsync must keep the live file ─────────────────────
+
+
+def test_failed_archive_dir_fsync_keeps_live_file(tmp_path, monkeypatch):
+    """The live file is the only copy until the archive is durably synced.
+
+    Reproduces the gate finding: a failed archive-directory fsync was ignored
+    and the live file was then removed, so a crash at that point could lose the
+    run's only durable copy.
+    """
+    path = _write_run(tmp_path, "s1", "r1", mtime_age_days=30)
+    # Pre-create the archive dir so the dir-chain sync is not the thing tested.
+    (tmp_path / rj.RUN_JOURNAL_ARCHIVE_DIR_NAME / "s1").mkdir(parents=True)
+
+    real_fsync = os.fsync
+
+    def failing_dir_fsync(fd):
+        import stat as _stat
+
+        if _stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError("injected dir fsync failure")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(rj.os, "fsync", failing_dir_fsync)
+    counters = _sweep(tmp_path, ttl_days=14, max_runs_per_session=0, max_bytes_per_session=0)
+    monkeypatch.undo()
+
+    assert path.exists(), "live file removed although the archive fsync failed"
+    assert counters["archived_files"] == 0
+    # The run is still fully readable from the live copy.
+    events = rj.read_run_events("s1", "r1", session_dir=tmp_path)
+    assert len(events["events"]) > 0
+
+
 # ── ownership: the pinned raw handle must close on every exit path ──────────
 
 
