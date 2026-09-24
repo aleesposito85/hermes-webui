@@ -15,6 +15,7 @@ import shutil
 import stat
 import threading
 import time
+import weakref
 from copy import deepcopy
 from collections import OrderedDict
 from pathlib import Path
@@ -192,12 +193,23 @@ _SWEEP_RUN_LOCK = threading.Lock()
 # and the sweep ACQUIRES THAT LOCK NON-BLOCKINGLY: a session being deleted is
 # simply skipped by the current pass (fail closed — never archive into a session
 # that is being removed).
-_SESSION_LOCKS: dict[str, threading.Lock] = {}
+#
+# Entries are WEAK references: a lock is only needed while some caller actually
+# holds or wants it, and an installation with ongoing session churn would
+# otherwise accumulate one lock per session id forever. A dead (unreferenced)
+# entry is dropped opportunistically on every lookup/eviction, so the registry
+# tracks live coordination only.
+_SESSION_LOCKS: "weakref.WeakValueDictionary[str, threading.Lock]" = weakref.WeakValueDictionary()
 _SESSION_LOCKS_GUARD = threading.Lock()
 
 
 def _session_lock_for(session_root: Path, session_id: str) -> threading.Lock:
-    """Return the lock coordinating one session's sweep with its deletion."""
+    """Return the lock coordinating one session's sweep with its deletion.
+
+    The registry holds WEAK references, so entries for sessions nobody is
+    coordinating anymore are collected automatically (the lock itself stays
+    alive while a caller holds the returned reference).
+    """
     key = f"{session_root}\x00{session_id}"
     with _SESSION_LOCKS_GUARD:
         lock = _SESSION_LOCKS.get(key)
@@ -1337,8 +1349,6 @@ def delete_run_journal(session_id: str, *, session_dir: Path | None = None) -> b
     this unconditionally on delete. Returns ``True`` if a directory was
     removed, ``False`` otherwise.
     """
-    import shutil
-
     sid = str(session_id or "").strip()
     # Reject path-traversal ids: the regex below permits dots, so a bare "." or
     # ".." would resolve `root / RUN_JOURNAL_DIR_NAME / sid` to the journal ROOT
@@ -1367,10 +1377,16 @@ def delete_run_journal(session_id: str, *, session_dir: Path | None = None) -> b
         # cannot be acquired, nothing inside that root is trusted, so the archive
         # side is left alone and only the live journal is removed.
         _remove_archive_session_tree(root, sid)
-        if not session_journal_dir.exists():
+        # Remove the LIVE journal directory the same way. A path-based
+        # ``shutil.rmtree`` here is check-then-use: the existence check resolves
+        # the pathname, then the recursive delete resolves it AGAIN, so a
+        # directory swapped to a symlink in between makes rmtree destroy a
+        # foreign tree. The journal root is pinned (O_NOFOLLOW), the session
+        # entry is opened relative to it with O_NOFOLLOW, and the tree is then
+        # cleared fd-relatively and removed by name from the pinned root.
+        removed = _remove_live_session_tree(root, sid)
+        if not removed:
             return False
-        shutil.rmtree(session_journal_dir, ignore_errors=True)
-        removed = not session_journal_dir.exists()
     # Evict any writer locks the removed runs left behind. `_lock_for` keys are
     # ``(str(path.parent), path.name, pid)`` and every run file for this session
     # lives directly under ``session_journal_dir``, so drop all keys whose parent
@@ -1457,6 +1473,54 @@ def _remove_archive_session_tree(session_root: Path, session_id: str) -> None:
             os.close(root_fd)
         except OSError:
             pass
+
+
+def _remove_live_session_tree(session_root: Path, session_id: str) -> bool:
+    """Delete ``_run_journal/<sid>/`` through pinned, no-follow handles.
+
+    A path-based ``shutil.rmtree`` is check-then-use on a destructive
+    operation: the existence check and the recursive delete each resolve the
+    same mutable pathname, so a directory swapped to a symlink in between sends
+    the delete outside the journal tree. Here the journal ROOT is pinned with
+    ``O_NOFOLLOW``, the session entry is opened relative to that pinned handle
+    with ``O_NOFOLLOW`` (so a symlinked session dir is refused), the tree is
+    cleared fd-relatively, and the entry is finally removed by name from the
+    pinned root — no pathname is re-resolved at any point.
+
+    Returns True when the session directory was removed, False when it was
+    absent or could not be trusted.
+    """
+    root_fd = _open_dir_no_follow(session_root / RUN_JOURNAL_DIR_NAME)
+    if root_fd is None:
+        return False
+    session_fd = None
+    removed = False
+    try:
+        try:
+            session_fd = os.open(
+                session_id, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW, dir_fd=root_fd
+            )
+        except OSError:
+            return False
+        _remove_dir_tree(session_fd)
+        try:
+            os.close(session_fd)
+            session_fd = None
+            os.rmdir(session_id, dir_fd=root_fd)
+            removed = True
+        except OSError:
+            pass
+    finally:
+        if session_fd is not None:
+            try:
+                os.close(session_fd)
+            except OSError:
+                pass
+        try:
+            os.close(root_fd)
+        except OSError:
+            pass
+    return removed
 
 
 def _open_dir_no_follow(path: Path) -> int | None:

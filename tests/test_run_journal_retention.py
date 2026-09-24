@@ -21,6 +21,7 @@ What must hold:
 import gzip
 import json
 import os
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -917,6 +918,64 @@ def test_sweep_skips_session_whose_deletion_is_in_flight(tmp_path):
     assert not _archive_path(tmp_path, "s1", "r1").exists()
     assert _archive_path(tmp_path, "s2", "r2").exists()
     assert counters["archived_files"] == 1
+
+
+# ── live deletion containment + lock-registry lifecycle ─────────────────────
+
+
+def test_live_deletion_does_not_follow_symlinked_journal_root(tmp_path):
+    """Deletion must not follow a symlinked ``_run_journal`` out of the tree.
+
+    Reproduces the finding: deletion checked the mutable live path and then
+    handed it to ``shutil.rmtree``, so with ``_run_journal`` replaced by a
+    symlink the recursive delete resolved the pathname again and destroyed a
+    foreign tree (in the probe: an external ``s1/PRECIOUS.txt`` was deleted).
+    The pinned, no-follow implementation refuses the symlinked root and leaves
+    the external tree alone.
+    """
+    _write_run(tmp_path, "s1", "r1", mtime_age_days=0)
+    # Replace the journal root with a symlink to an external tree that contains
+    # a decoy "s1" directory holding data that must survive.
+    external = tmp_path.parent / f"{tmp_path.name}-external-jroot"
+    (external / "s1").mkdir(parents=True)
+    precious = external / "s1" / "PRECIOUS.txt"
+    precious.write_text("must survive", encoding="utf-8")
+    journal_root = tmp_path / rj.RUN_JOURNAL_DIR_NAME
+    shutil.rmtree(journal_root, ignore_errors=True)
+    journal_root.symlink_to(external, target_is_directory=True)
+
+    result = rj.delete_run_journal("s1", session_dir=tmp_path)
+
+    assert result is False, "deletion claimed success through a symlinked journal root"
+    assert precious.exists(), "external file deleted through a symlinked journal root"
+    assert (external / "s1").is_dir(), "external directory deleted"
+
+
+def test_session_lock_registry_does_not_grow_without_bound(tmp_path):
+    """The per-session lock registry must not retain entries forever.
+
+    Reproduces the finding: `_session_lock_for` stored a strong reference for
+    every session the sweep or a deletion ever touched, so ongoing session churn
+    grew the registry without bound. The registry now holds weak references, so
+    an entry with no live user is dropped automatically.
+    """
+    import gc
+
+    for i in range(50):
+        lock = rj._session_lock_for(tmp_path, f"s{i}")
+        assert isinstance(lock, type(__import__("threading").Lock()))
+        del lock
+    gc.collect()
+
+    remaining = len(rj._SESSION_LOCKS)
+    assert remaining == 0, f"registry retained {remaining} dead locks"
+
+
+def test_session_lock_registry_keeps_live_lock_alive(tmp_path):
+    """A lock still in use must not be collected (it must stay the same object)."""
+    held = rj._session_lock_for(tmp_path, "s1")
+    again = rj._session_lock_for(tmp_path, "s1")
+    assert held is again, "an in-use lock was replaced — mutual exclusion would break"
 
 
 # ── ownership: the pinned raw handle must close on every exit path ──────────
