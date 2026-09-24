@@ -24,6 +24,8 @@ import os
 import time
 from pathlib import Path
 
+import pytest
+
 from api import run_journal as rj
 
 
@@ -674,6 +676,74 @@ def _external_row_bytes(sid: str, rid: str) -> bytes:
         )
         + "\n"
     ).encode("utf-8")
+
+
+# ── ownership: the pinned raw handle must close on every exit path ──────────
+
+
+def _archived_run_with_held_raw(tmp_path, monkeypatch):
+    """Archive one run and return (live_style_path, raws_list, real_open).
+
+    ``raws_list`` receives a STRONG reference to every raw handle opened by
+    ``_open_archive_entry``. Keeping the reference alive is the point: it stops
+    CPython refcount finalization from masking a missing explicit close.
+    """
+    _write_run(tmp_path, "s1", "r1", mtime_age_days=30,
+               events=[("token", {"text": f"line-{i}"}) for i in range(12)])
+    _sweep(tmp_path, ttl_days=14, max_runs_per_session=0, max_bytes_per_session=0)
+    assert _archive_path(tmp_path, "s1", "r1").exists()
+
+    raws: list = []
+    real_open = rj._open_archive_entry
+
+    def spy_open(path):
+        fh = real_open(path)
+        if fh is not None:
+            raws.append(fh)
+        return fh
+
+    monkeypatch.setattr(rj, "_open_archive_entry", spy_open)
+    return tmp_path / rj.RUN_JOURNAL_DIR_NAME / "s1" / "r1.jsonl", raws
+
+
+def test_streaming_archive_read_closes_pinned_handle_on_completion(tmp_path, monkeypatch):
+    """Full consumption of the bounded iterator must close the pinned raw handle.
+
+    GzipFile.close() does not close a caller-supplied fileobj, so wrapping a
+    pinned descriptor without owning it leaves closure to refcount finalization.
+    The holder list keeps the raw handle strongly referenced, so only an
+    explicit close can satisfy this.
+    """
+    path, raws = _archived_run_with_held_raw(tmp_path, monkeypatch)
+    lines = list(rj._iter_bounded_raw_jsonl_lines(path, max_bytes=10_000_000))
+    monkeypatch.undo()
+
+    assert lines, "iterator yielded nothing"
+    assert raws, "_open_archive_entry was not used"
+    assert all(raw.closed for raw in raws), "pinned raw handle left open after full consumption"
+
+
+def test_streaming_archive_read_closes_pinned_handle_on_limit_exception(tmp_path, monkeypatch):
+    """A replay-limit ValueError mid-iteration must still close the raw handle."""
+    path, raws = _archived_run_with_held_raw(tmp_path, monkeypatch)
+    with pytest.raises(ValueError):
+        list(rj._iter_bounded_raw_jsonl_lines(path, max_bytes=16))
+    monkeypatch.undo()
+
+    assert raws, "_open_archive_entry was not used"
+    assert all(raw.closed for raw in raws), "pinned raw handle left open after replay-limit raise"
+
+
+def test_streaming_archive_read_closes_pinned_handle_on_generator_close(tmp_path, monkeypatch):
+    """Abandoning the generator (close() without exhaustion) must close the raw handle."""
+    path, raws = _archived_run_with_held_raw(tmp_path, monkeypatch)
+    iterator = rj._iter_bounded_raw_jsonl_lines(path, max_bytes=10_000_000)
+    next(iterator)
+    iterator.close()
+    monkeypatch.undo()
+
+    assert raws, "_open_archive_entry was not used"
+    assert all(raw.closed for raw in raws), "pinned raw handle left open after generator close"
 
 
 # ── pruning: a replacement archive must never be pruned ─────────────────────

@@ -5,6 +5,7 @@ the existing in-process streaming path without changing execution ownership.
 """
 from __future__ import annotations
 
+import contextlib
 import gzip
 import json
 import logging
@@ -682,31 +683,50 @@ def _event_created_at(event: dict, *, fallback: float = 0.0) -> float:
         return fallback
 
 
+@contextlib.contextmanager
 def _run_journal_file_bytes(path: Path):
-    """Return a binary reader for a run file: live ``.jsonl`` or archived ``.jsonl.gz``.
+    """Yield a binary reader for a run file: live ``.jsonl`` or archived ``.jsonl.gz``.
+
+    A context manager because the archived branch opens a PINNED raw descriptor
+    (:func:`_open_archive_entry`) and wraps it in ``gzip.GzipFile``: Python's
+    ``GzipFile.close()`` deliberately does NOT close a caller-supplied
+    ``fileobj`` (the caller may want to read further members), so wrapping
+    without owning the raw handle would leave the descriptor's closure to
+    refcount finalization — wrong on non-refcounting runtimes and fragile under
+    constructor errors or abandonment. Both owners are therefore nested here
+    explicitly, so the descriptor closes on normal return, on a replay-limit
+    ``ValueError``, on corrupt-gzip ``OSError``, and on generator close.
 
     Raises FileNotFoundError when neither copy exists. The both-exist case is
     handled by the caller via :func:`_read_run_file_text` (it needs row-level
     merging); this opener is for streaming reads of a single copy. Archived
-    copies are opened through pinned directory handles
-    (:func:`_open_archive_entry`) so a concurrent path swap cannot redirect the
-    read outside the archive tree.
+    copies are opened through pinned directory handles so a concurrent path
+    swap cannot redirect the read outside the archive tree.
     """
     if path.suffix == ".gz" or path.name.endswith(".jsonl.gz"):
-        fh = _open_archive_entry(path)
-        if fh is None:
+        raw = _open_archive_entry(path)
+        if raw is None:
             raise FileNotFoundError(str(path))
-        return gzip.GzipFile(fileobj=fh, mode="rb")
+        with raw:
+            with gzip.GzipFile(fileobj=raw, mode="rb") as gz:
+                yield gz
+        return
     try:
-        return path.open("rb")
+        live = path.open("rb")
     except FileNotFoundError:
         archived = _archive_path_for(path)
         if archived is None:
             raise
-        fh = _open_archive_entry(archived)
-        if fh is None:
-            raise
-        return gzip.GzipFile(fileobj=fh, mode="rb")
+        raw = _open_archive_entry(archived)
+        if raw is None:
+            # Preserve the "neither copy exists" contract of the live branch.
+            raise FileNotFoundError(str(archived)) from None
+        with raw:
+            with gzip.GzipFile(fileobj=raw, mode="rb") as gz:
+                yield gz
+        return
+    with live:
+        yield live
 
 
 def _iter_bounded_raw_jsonl_lines(path: Path, *, max_bytes: int, retained_bytes: int = 0):
@@ -731,36 +751,35 @@ def _iter_bounded_raw_jsonl_lines(path: Path, *, max_bytes: int, retained_bytes:
             yield line_no, raw_bytes, total_bytes
         return
     try:
-        fh = _run_journal_file_bytes(path)
-    except FileNotFoundError:
-        return
-    with fh:
-        while True:
-            chunk = fh.read(_SESSION_REPLAY_READ_CHUNK_BYTES)
-            if not chunk:
-                if buffered:
+        with _run_journal_file_bytes(path) as fh:
+            while True:
+                chunk = fh.read(_SESSION_REPLAY_READ_CHUNK_BYTES)
+                if not chunk:
+                    if buffered:
+                        if total_bytes + len(buffered) > max_bytes:
+                            raise ValueError("replay_limit_bytes")
+                        line_no += 1
+                        total_bytes += len(buffered)
+                        yield line_no, bytes(buffered), total_bytes
+                    return
+                start = 0
+                while start < len(chunk):
+                    newline = chunk.find(b"\n", start)
+                    if newline == -1:
+                        buffered.extend(chunk[start:])
+                        if total_bytes + len(buffered) > max_bytes:
+                            raise ValueError("replay_limit_bytes")
+                        break
+                    buffered.extend(chunk[start : newline + 1])
                     if total_bytes + len(buffered) > max_bytes:
                         raise ValueError("replay_limit_bytes")
                     line_no += 1
                     total_bytes += len(buffered)
                     yield line_no, bytes(buffered), total_bytes
-                return
-            start = 0
-            while start < len(chunk):
-                newline = chunk.find(b"\n", start)
-                if newline == -1:
-                    buffered.extend(chunk[start:])
-                    if total_bytes + len(buffered) > max_bytes:
-                        raise ValueError("replay_limit_bytes")
-                    break
-                buffered.extend(chunk[start : newline + 1])
-                if total_bytes + len(buffered) > max_bytes:
-                    raise ValueError("replay_limit_bytes")
-                line_no += 1
-                total_bytes += len(buffered)
-                yield line_no, bytes(buffered), total_bytes
-                buffered.clear()
-                start = newline + 1
+                    buffered.clear()
+                    start = newline + 1
+    except FileNotFoundError:
+        return
 
 
 def append_run_event(
