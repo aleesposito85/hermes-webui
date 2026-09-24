@@ -978,6 +978,53 @@ def test_session_lock_registry_keeps_live_lock_alive(tmp_path):
     assert held is again, "an in-use lock was replaced — mutual exclusion would break"
 
 
+def test_deletion_still_removes_transcripts_without_pinned_handles(tmp_path, monkeypatch):
+    """On no-pin platforms (Windows) deletion must still remove the transcripts.
+
+    Reproduces the finding: the pinned implementation returns False when
+    ``dir_fd``/``O_NOFOLLOW`` are unavailable, and the delete route discards that
+    result — so a deleted session kept its recoverable run transcripts on disk.
+    Privacy must fail CLOSED here (remove the tree), not open (leave it).
+
+    The platform is simulated the way the module itself distinguishes it: no
+    pinned directory opens are available (on Windows, ``os.open`` cannot open a
+    directory at all, so ``_open_dir_no_follow`` yields nothing), and the
+    ``_DIR_FD_OK`` capability flag is off. NOTE: the module's ``O_*`` constants
+    are NOT zeroed — on a POSIX host that still opens successfully and would
+    test the pinned path, not the fallback.
+    """
+    path = _write_run(tmp_path, "s1", "r1", mtime_age_days=0)
+    session_dir = path.parent
+
+    monkeypatch.setattr(rj, "_DIR_FD_OK", False)
+    monkeypatch.setattr(rj, "_open_dir_no_follow", lambda _path: None)
+
+    result = rj.delete_run_journal("s1", session_dir=tmp_path)
+
+    assert result is True, "deletion reported failure on a no-pin platform"
+    assert not session_dir.exists(), "recoverable transcripts left on disk"
+
+
+def test_deletion_refuses_symlinked_root_without_pinning_available(tmp_path, monkeypatch):
+    """The no-pin fallback still refuses a symlinked journal root."""
+    _write_run(tmp_path, "s1", "r1", mtime_age_days=0)
+    external = tmp_path.parent / f"{tmp_path.name}-external-fallback"
+    (external / "s1").mkdir(parents=True)
+    precious = external / "s1" / "PRECIOUS.txt"
+    precious.write_text("must survive", encoding="utf-8")
+    journal_root = tmp_path / rj.RUN_JOURNAL_DIR_NAME
+    shutil.rmtree(journal_root, ignore_errors=True)
+    journal_root.symlink_to(external, target_is_directory=True)
+
+    monkeypatch.setattr(rj, "_DIR_FD_OK", False)
+    monkeypatch.setattr(rj, "_open_dir_no_follow", lambda _path: None)
+
+    result = rj.delete_run_journal("s1", session_dir=tmp_path)
+
+    assert result is False
+    assert precious.exists(), "fallback followed a symlinked root"
+
+
 # ── ownership: the pinned raw handle must close on every exit path ──────────
 
 

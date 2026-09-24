@@ -1490,8 +1490,16 @@ def _remove_live_session_tree(session_root: Path, session_id: str) -> bool:
     Returns True when the session directory was removed, False when it was
     absent or could not be trusted.
     """
+    if not _DIR_FD_OK:
+        # The platform cannot pin at all (Windows). This is a PRIVACY path:
+        # returning False would leave the deleted session's recoverable
+        # transcripts on disk. Fall back to a path-based removal (which still
+        # refuses a symlinked root), because leaving the data is the worse
+        # failure here and the pinned form is simply unavailable.
+        return _remove_session_tree_by_path(session_root, session_id)
     root_fd = _open_dir_no_follow(session_root / RUN_JOURNAL_DIR_NAME)
     if root_fd is None:
+        # Pinnable platform, but the root is absent or itself a symlink: refuse.
         return False
     session_fd = None
     removed = False
@@ -1521,6 +1529,28 @@ def _remove_live_session_tree(session_root: Path, session_id: str) -> bool:
         except OSError:
             pass
     return removed
+
+
+def _remove_session_tree_by_path(session_root: Path, session_id: str) -> bool:
+    """Path-based removal of ``_run_journal/<sid>/`` (no-pin platforms only).
+
+    Windows (no ``dir_fd``/``O_NOFOLLOW``) cannot pin handles, so this is the
+    only possible implementation there. It still refuses to follow a symlinked
+    FINAL component, then removes the tree by path. Used exclusively by the
+    privacy deletion path, where leaving a deleted session's transcripts behind
+    is the worse failure: the pinned form is used whenever the platform offers
+    it (see ``_remove_live_session_tree``).
+    """
+    import shutil as _shutil
+
+    journal_root = session_root / RUN_JOURNAL_DIR_NAME
+    target = journal_root / session_id
+    if journal_root.is_symlink() or target.is_symlink():
+        return False
+    if not target.exists():
+        return False
+    _shutil.rmtree(target, ignore_errors=True)
+    return not target.exists()
 
 
 def _open_dir_no_follow(path: Path) -> int | None:
