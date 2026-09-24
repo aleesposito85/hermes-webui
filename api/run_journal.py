@@ -2815,15 +2815,38 @@ def _prune_run_journal_archive(session_root: Path, caps: dict, now: float, count
     Pruning that prefix would make the surviving rows noncontiguous and session
     replay would fail with ``replay_noncontiguous``. The check and the prune
     run under the run's writer lock, so an append cannot slip between them.
+
+    The live-counterpart check pins the LIVE ROOT once (``O_NOFOLLOW``) and
+    opens each session relative to that handle: resolving ``_run_journal/<sid>``
+    through the mutable pathname would let a swapped root substitute a foreign
+    tree, conclude the run has no live suffix, and delete the stored prefix.
+    A live root that is present but cannot be pinned (symlink, unopenable)
+    keeps every archive — a prune must fail closed.
     """
     ttl_days = float(caps.get("archive_ttl_days") or 0.0)
     if ttl_days <= 0:
         return
+    live_root = session_root / RUN_JOURNAL_DIR_NAME
+    # Pin the LIVE root once for the whole prune. When it exists but cannot be
+    # pinned, skip pruning entirely (fail closed): the live-counterpart check
+    # is what protects live suffix pairs, so it may not run on an untrusted
+    # pathname.
+    live_root_fd = -1
+    try:
+        if live_root.exists() or live_root.is_symlink():
+            live_root_fd = _open_dir_no_follow(live_root)
+            if live_root_fd is None:
+                return
+    except OSError:
+        return
     opened = _open_archive_root_no_follow(session_root)
     if opened is None:
+        try:
+            os.close(live_root_fd)
+        except OSError:
+            pass
         return
     root_fd, _parent_synced = opened
-    live_root = session_root / RUN_JOURNAL_DIR_NAME
     try:
         try:
             names = sorted(os.listdir(root_fd))
@@ -2840,10 +2863,19 @@ def _prune_run_journal_archive(session_root: Path, caps: dict, now: float, count
                 )
             except OSError:
                 continue
-            # Pinned handle for the live counterpart of this session (None when
-            # the session has no live directory at all: every run is fully
-            # archived, so age-only pruning is safe).
-            live_session_fd = _open_dir_no_follow(live_root / name)
+            # Pinned handle for the live counterpart of this session, opened
+            # RELATIVE to the pinned live root (None when the session has no
+            # live directory at all: every run is fully archived, so age-only
+            # pruning is safe). A symlinked session entry is refused (openat
+            # O_NOFOLLOW), which keeps pruning closed rather than redirected.
+            live_session_fd = None
+            if live_root_fd >= 0:
+                try:
+                    live_session_fd = os.open(
+                        name, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW, dir_fd=live_root_fd
+                    )
+                except OSError:
+                    live_session_fd = None
             try:
                 for entry in sorted(os.listdir(session_fd)):
                     if not entry.endswith(".jsonl.gz"):
@@ -2878,10 +2910,12 @@ def _prune_run_journal_archive(session_root: Path, caps: dict, now: float, count
                         except OSError:
                             pass
     finally:
-        try:
-            os.close(root_fd)
-        except OSError:
-            pass
+        for fd in (root_fd, live_root_fd):
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
 
 
 def sweep_run_journal(

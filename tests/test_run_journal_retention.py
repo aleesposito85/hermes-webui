@@ -1233,6 +1233,76 @@ def test_fallback_deletion_root_swap_restores_entry_and_fails_closed(tmp_path, m
 # ── TTL pruning must not orphan a run's live suffix (CORE 3) ────────────────
 
 
+def test_prune_live_check_is_not_redirected_by_swapped_live_root(tmp_path, monkeypatch):
+    """The live-counterpart check must not resolve the mutable live-root pathname.
+
+    Reproduces the finding: the prune opened ``_run_journal/<sid>`` through the
+    live-root pathname per session, so a root swapped for a symlink between
+    checks made the prune inspect the substitute tree, conclude the run had no
+    live suffix, and delete the only stored prefix (reads then lost seq 1 and
+    replay reported ``replay_noncontiguous``). The live root is now pinned once
+    and sessions open relative to that handle; a live root that is present but
+    not pinnable keeps every archive (fail closed).
+    """
+    sid, rid = "s1", "r1"
+    archive_dir = tmp_path / rj.RUN_JOURNAL_ARCHIVE_DIR_NAME / sid
+    archive_dir.mkdir(parents=True)
+
+    def _row(seq, name, terminal=False):
+        return {
+            "version": 1, "event_id": f"{rid}:{seq}", "seq": seq, "run_id": rid,
+            "session_id": sid, "event": name, "type": name,
+            "created_at": time.time() - 3600, "terminal": terminal,
+            "terminal_state": "completed" if terminal else None,
+            "payload": {"terminal_state": "completed"} if terminal else {"text": "x"},
+        }
+
+    # Aged archived prefix (seq 1) + fresh live suffix (seq 2, terminal).
+    archive = archive_dir / f"{rid}.jsonl.gz"
+    with gzip.open(archive, "wb") as gz:
+        gz.write((json.dumps(_row(1, "token"), separators=(",", ":")) + "\n").encode())
+    old = time.time() - 400 * 86400
+    os.utime(archive, (old, old))
+    live_dir = tmp_path / rj.RUN_JOURNAL_DIR_NAME / sid
+    live_dir.mkdir(parents=True)
+    (live_dir / f"{rid}.jsonl").write_text(
+        json.dumps(_row(2, "done", True), separators=(",", ":")) + "\n", encoding="utf-8"
+    )
+
+    journal_root = tmp_path / rj.RUN_JOURNAL_DIR_NAME
+    foreign = tmp_path.parent / f"{tmp_path.name}-foreign-live"
+    foreign.mkdir()
+
+    # Swap the live-root pathname at the moment the prune starts: the sweep has
+    # already pinned its root handle, so the pin is unaffected while every
+    # pathname-based check inside the prune is redirected.
+    real_prune = rj._prune_run_journal_archive
+    state = {"swapped": False}
+
+    def swap_then_prune(*args, **kwargs):
+        if not state["swapped"]:
+            state["swapped"] = True
+            os.rename(journal_root, tmp_path / "_run_journal-real-saved")
+            journal_root.symlink_to(foreign, target_is_directory=True)
+        return real_prune(*args, **kwargs)
+
+    monkeypatch.setattr(rj, "_prune_run_journal_archive", swap_then_prune)
+    monkeypatch.setenv(rj._RETENTION_ARCHIVE_TTL_ENV, "30")
+    counters = _sweep(tmp_path, ttl_days=0, max_runs_per_session=0, max_bytes_per_session=0)
+
+    assert state["swapped"], "test did not trigger the swap"
+    assert archive.exists(), "the swapped live-root redirected the prune"
+    assert counters["pruned_archives"] == 0
+
+    # Restore the real tree; reads must be complete.
+    journal_root.unlink()
+    os.rename(tmp_path / "_run_journal-real-saved", journal_root)
+    read = rj.read_run_events(sid, rid, session_dir=tmp_path)
+    assert [int(e["seq"]) for e in read["events"]] == [1, 2]
+    replay = rj.read_session_run_events(sid, after_event_id=f"{rid}:1", session_dir=tmp_path)
+    assert replay["status"] == "ok", replay["status"]
+
+
 def test_archive_prune_keeps_archive_while_live_suffix_exists(tmp_path, monkeypatch):
     """TTL must not prune a prefix while the same run still has live rows.
 
