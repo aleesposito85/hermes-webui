@@ -21,6 +21,7 @@ What must hold:
 import gzip
 import json
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -865,6 +866,57 @@ def test_un_synced_new_archive_root_keeps_live_file(tmp_path, monkeypatch):
     assert counters["archived_files"] == 0
     events = rj.read_run_events("s1", "r1", session_dir=tmp_path)
     assert len(events["events"]) > 0
+
+
+def test_delete_does_not_wait_on_the_global_sweep_pass(tmp_path):
+    """Deletion coordinates per-session, not with the whole (long) sweep pass.
+
+    The sweep holds the global lock across every session — up to 512 MiB of
+    compression and pruning — and deletion runs synchronously on the request
+    path, so taking the global lock here could stall a delete request behind
+    unrelated sessions' work. On the pre-fix code this does not just stall: the
+    deletion BLOCKS on the held global lock, so the delete is asserted from a
+    worker thread with a join timeout (a hang is the failure symptom, but a
+    hanging test is a poor signal).
+    """
+    _write_run(tmp_path, "s1", "r1", mtime_age_days=30)
+
+    # Simulate a sweep mid-pass over unrelated sessions.
+    rj._SWEEP_RUN_LOCK.acquire()
+    try:
+        result: list = []
+
+        def _delete():
+            result.append(rj.delete_run_journal("s1", session_dir=tmp_path))
+
+        worker = threading.Thread(target=_delete, daemon=True)
+        worker.start()
+        worker.join(timeout=5.0)
+        blocked = worker.is_alive()
+    finally:
+        rj._SWEEP_RUN_LOCK.release()
+
+    assert not blocked, "deletion blocked on the global sweep pass (would stall the request path)"
+    assert result == [True]
+    assert not (tmp_path / rj.RUN_JOURNAL_DIR_NAME / "s1").exists()
+
+
+def test_sweep_skips_session_whose_deletion_is_in_flight(tmp_path):
+    """A session being deleted is skipped by the pass instead of raced."""
+    _write_run(tmp_path, "s1", "r1", mtime_age_days=30)
+    _write_run(tmp_path, "s2", "r2", mtime_age_days=30)
+
+    session_lock = rj._session_lock_for(tmp_path, "s1")
+    session_lock.acquire()
+    try:
+        counters = _sweep(tmp_path, ttl_days=14, max_runs_per_session=0, max_bytes_per_session=0)
+    finally:
+        session_lock.release()
+
+    # s1 was skipped (nothing archived for it); s2 was still swept.
+    assert not _archive_path(tmp_path, "s1", "r1").exists()
+    assert _archive_path(tmp_path, "s2", "r2").exists()
+    assert counters["archived_files"] == 1
 
 
 # ── ownership: the pinned raw handle must close on every exit path ──────────

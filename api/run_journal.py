@@ -184,6 +184,27 @@ _SWEEP_THREAD_LOCK = threading.Lock()
 # Serializes sweep bodies: the maintenance tick and any explicit caller never
 # scan (and archive) concurrently.
 _SWEEP_RUN_LOCK = threading.Lock()
+# Per-SESSION locks, so session deletion coordinates with the sweep for ITS
+# session instead of waiting on the whole pass. The sweep holds the global lock
+# above across all sessions (which may include up to 512 MiB of compression and
+# pruning), so taking that lock on the delete path would stall a request thread
+# behind unrelated sessions' work. Deletion takes only its own session's lock,
+# and the sweep ACQUIRES THAT LOCK NON-BLOCKINGLY: a session being deleted is
+# simply skipped by the current pass (fail closed — never archive into a session
+# that is being removed).
+_SESSION_LOCKS: dict[str, threading.Lock] = {}
+_SESSION_LOCKS_GUARD = threading.Lock()
+
+
+def _session_lock_for(session_root: Path, session_id: str) -> threading.Lock:
+    """Return the lock coordinating one session's sweep with its deletion."""
+    key = f"{session_root}\x00{session_id}"
+    with _SESSION_LOCKS_GUARD:
+        lock = _SESSION_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _SESSION_LOCKS[key] = lock
+        return lock
 
 
 def _default_session_dir() -> Path:
@@ -1327,14 +1348,19 @@ def delete_run_journal(session_id: str, *, session_dir: Path | None = None) -> b
         return False
     root = Path(session_dir) if session_dir is not None else _default_session_dir()
     session_journal_dir = root / RUN_JOURNAL_DIR_NAME / sid
-    # Serialize with the retention sweep. Archive publication and session
-    # deletion have no other shared lock: without this, a sweep can publish an
-    # archive AFTER this deletion's listing snapshot, and the (suppressed)
-    # final rmdir then fails on the non-empty directory — leaving a recoverable
-    # transcript behind after the session was deleted. Held across BOTH the
-    # archive removal and the live-directory removal so a sweep cannot interleave
-    # a publication anywhere inside the deletion.
-    with _SWEEP_RUN_LOCK:
+    # Serialize with the retention sweep for THIS session. Archive publication
+    # and session deletion have no other shared lock: without this, a sweep can
+    # publish an archive AFTER this deletion's listing snapshot and, if it lands
+    # after the final re-list, leave a recoverable transcript behind after the
+    # session was deleted. The lock is PER-SESSION (not the global sweep lock):
+    # the sweep holds the global lock across every session — up to 512 MiB of
+    # compression and pruning — and this deletion runs on the request path, so
+    # waiting on the global pass could stall the delete request behind unrelated
+    # sessions. The sweep takes this session's lock NON-BLOCKINGLY, so it skips
+    # (rather than races) a session that is being deleted. Held across BOTH the
+    # archive removal and the live-directory removal so no publication can
+    # interleave a sweep anywhere inside the deletion window.
+    with _session_lock_for(root, sid):
         # Remove the session's archives through PINNED, no-follow handles: a
         # symlinked `_run_journal_archive` (or a symlinked session dir inside it)
         # would otherwise make this delete a foreign directory. When the handles
@@ -2577,6 +2603,15 @@ def sweep_run_journal(
             if not _SAFE_ID_RE.fullmatch(session_journal_dir.name):
                 continue
             counters["sessions_scanned"] += 1
+            # Skip a session whose deletion is in flight: publishing an archive
+            # into it would race that deletion (and, if it landed after the
+            # deletion's final sweep of the directory, leave a recoverable
+            # transcript behind). Non-blocking, so the sweep never waits on a
+            # deletion either.
+            session_lock = _session_lock_for(root, session_journal_dir.name)
+            if not session_lock.acquire(blocking=False):
+                counters["skipped_files"] += 1
+                continue
             try:
                 _sweep_run_journal_session(
                     root, session_journal_dir, caps, sweep_now, counters, budget
@@ -2588,6 +2623,8 @@ def sweep_run_journal(
                     session_journal_dir,
                     exc_info=True,
                 )
+            finally:
+                session_lock.release()
         try:
             _prune_run_journal_archive(root, caps, sweep_now, counters)
         except Exception:
