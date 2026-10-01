@@ -1789,3 +1789,103 @@ def test_archive_only_session_claim_recovered_with_empty_live_root(tmp_path, mon
     assert not claim.exists(), "claim debris left behind"
     summary = rj.find_run_summary(rid, session_dir=tmp_path)
     assert summary is not None, "the run's only copy is unreachable"
+
+
+# ── claim grammar: canonical names can never parse as claims ────────────────
+
+
+def _write_claimlike_archive(tmp_path, sid, rid):
+    """An aged, readable archive for a run id that CONTAINS the claim marker."""
+    assert rj._validate_id(rid, "run_id") == rid, "test id must be writer-accepted"
+    archive_dir = tmp_path / rj.RUN_JOURNAL_ARCHIVE_DIR_NAME / sid
+    archive_dir.mkdir(parents=True)
+    canonical = archive_dir / f"{rid}.jsonl.gz"
+    row = {
+        "version": 1, "event_id": f"{rid}:1", "seq": 1, "run_id": rid,
+        "session_id": sid, "event": "done", "type": "done",
+        "created_at": time.time() - 3600, "terminal": True,
+        "terminal_state": "completed", "payload": {"terminal_state": "completed"},
+    }
+    body = (json.dumps(row, separators=(",", ":")) + "\n").encode()
+    with gzip.open(canonical, "wb") as gz:
+        gz.write(body)
+    old = time.time() - 400 * 86400
+    os.utime(canonical, (old, old))
+    return canonical, body
+
+
+def test_canonical_archive_for_claimlike_run_id_not_restored_as_claim(tmp_path):
+    """A canonical archive whose run id contains '.prune-claim.' survives recovery.
+
+    Reproduces the finding: ``_validate_id`` accepts ``.r.jsonl.gz.prune-claim.999``
+    whose canonical archive is ``.r.jsonl.gz.prune-claim.999.jsonl.gz``. The
+    recovery pass found the marker with an unanchored ``find()``, treated the
+    CANONICAL archive as a claim for run ``r``, hard-linked it under
+    ``r.jsonl.gz`` and unlinked its real name — the run's only copy became
+    undiscoverable (``find_run_summary`` -> None). The claim grammar is now
+    anchored end-to-end, so a canonical name can never parse as a claim.
+    """
+    sid, rid = "s1", ".r.jsonl.gz.prune-claim.999"
+    canonical, body = _write_claimlike_archive(tmp_path, sid, rid)
+    # No live root at all: archive-only recovery runs despite the early return.
+
+    counters = rj.sweep_run_journal(
+        session_dir=tmp_path, ttl_days=0, max_runs_per_session=0, max_bytes_per_session=0
+    )
+
+    assert counters["errors"] == 0
+    assert canonical.exists(), "the canonical archive was renamed away as claim debris"
+    with gzip.open(canonical, "rb") as fh:
+        assert fh.read() == body, "the canonical archive's bytes changed"
+    misattributed = canonical.parent / "r.jsonl.gz"
+    assert not misattributed.exists(), "the archive was misattributed to another run id"
+    read = rj.read_run_events(sid, rid, session_dir=tmp_path)
+    assert [int(e["seq"]) for e in read["events"]] == [1]
+    summary = rj.find_run_summary(rid, session_dir=tmp_path)
+    assert summary is not None, "the run's only copy is undiscoverable"
+
+
+def test_canonical_archive_for_claimlike_run_id_survives_with_live_root(tmp_path):
+    """Same collision, with a live root present (the normal sweep path)."""
+    sid, rid = "s1", ".r.jsonl.gz.prune-claim.999"
+    canonical, body = _write_claimlike_archive(tmp_path, sid, rid)
+    # A live root, so the sweep takes the normal path (not the early return).
+    (tmp_path / rj.RUN_JOURNAL_DIR_NAME / "s2").mkdir(parents=True)
+
+    counters = rj.sweep_run_journal(
+        session_dir=tmp_path, ttl_days=0, max_runs_per_session=0, max_bytes_per_session=0
+    )
+
+    assert counters["errors"] == 0
+    assert canonical.exists(), "the canonical archive was renamed away as claim debris"
+    with gzip.open(canonical, "rb") as fh:
+        assert fh.read() == body
+    assert not (canonical.parent / "r.jsonl.gz").exists()
+    summary = rj.find_run_summary(rid, session_dir=tmp_path)
+    assert summary is not None
+
+
+def test_genuine_claim_for_claimlike_run_id_is_still_restored(tmp_path):
+    """The anchored grammar still recovers a REAL claim for such a run id.
+
+    The claim for run ``.r.jsonl.gz.prune-claim.999`` is
+    ``..r.jsonl.gz.prune-claim.999.jsonl.gz.prune-claim.<pid>`` — the fix must
+    not swing so far that genuine recovery stops working for these ids.
+    """
+    sid, rid = "s1", ".r.jsonl.gz.prune-claim.999"
+    canonical, body = _write_claimlike_archive(tmp_path, sid, rid)
+    # Simulate the crash: the canonical entry was claimed (renamed), never unlinked.
+    claim = canonical.parent / f".{rid}.jsonl.gz.prune-claim.999"
+    os.rename(canonical, claim)
+    old = time.time() - 7200  # past the quiescence window
+    os.utime(claim, (old, old))
+
+    counters = rj.sweep_run_journal(
+        session_dir=tmp_path, ttl_days=0, max_runs_per_session=0, max_bytes_per_session=0
+    )
+
+    assert counters["errors"] == 0
+    assert canonical.exists(), "a genuine claim was not restored"
+    with gzip.open(canonical, "rb") as fh:
+        assert fh.read() == body
+    assert not claim.exists(), "claim debris left behind"

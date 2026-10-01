@@ -36,6 +36,21 @@ _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 # can never be deleted as debris by the next sweep: substring matching would do
 # exactly that.
 _ARCHIVE_TEMP_RE = re.compile(r"^\.[A-Za-z0-9_.-]+\.jsonl\.gz\.tmp\.\d+$")
+# Prune-claim entries: ``.{canonical}.prune-claim.{pid}`` — the exact shape
+# ``_prune_archive_entry`` creates (canonical ends ``.jsonl.gz``). Anchored at
+# BOTH ends: an unanchored ``find(".prune-claim.")`` also matched a CANONICAL
+# archive whose run id itself contains the marker (e.g. run id
+# ``.r.jsonl.gz.prune-claim.999`` -> ``.r.jsonl.gz.prune-claim.999.jsonl.gz``),
+# and recovery "restored" that archive under ``r.jsonl.gz`` — renaming the
+# run's only copy to a name its readers never resolve.
+#
+# Anchoring disambiguates by construction: canonical names always END in
+# ``.jsonl.gz`` while claims always END in ``.prune-claim.<digits>``, so the
+# two grammars are suffix-disjoint and no accepted run id can make one parse
+# as the other.
+_ARCHIVE_CLAIM_RE = re.compile(
+    r"^\.(?P<original>[A-Za-z0-9_.-]+\.jsonl\.gz)\.prune-claim\.(?P<pid>\d+)$"
+)
 _WRITER_LOCKS: dict[tuple[str, str, str], threading.Lock] = {}
 _WRITER_LOCKS_GUARD = threading.Lock()
 # Next-seq to assign per run-journal file path, kept in memory so repeat appends
@@ -2545,17 +2560,24 @@ def resolve_run_journal_retention_caps() -> dict:
 def _cleanup_archive_temps(archive_fd: int) -> None:
     """Recover stray archive-directory debris left by an interrupted pass.
 
-    Two shapes:
+    Two shapes, both matched by their FULL anchored grammar:
 
       * ``.{run}.jsonl.gz.tmp.{pid}`` — an aborted archive attempt (the live
         file survived, so the temp is garbage). Matched as the FULL shape so a
         COMPLETED archive whose run id merely contains ``.gz.tmp.`` (e.g.
         ``r.gz.tmp.x.jsonl.gz``) is never deleted as debris;
-      * ``.prune-claim.`` — a prune that was interrupted after claiming an entry
-        (crash/power loss between ``rename`` and ``unlink``). The claimed entry
-        may be the ONLY copy of that run, so it is RESTORED to its canonical
-        name (never deleted); if the canonical name is occupied the claim is a
-        redundant older copy and is dropped.
+      * ``.{canonical}.prune-claim.{pid}`` — a prune that was interrupted after
+        claiming an entry (crash/power loss between ``rename`` and ``unlink``).
+        The claimed entry may be the ONLY copy of that run, so it is RESTORED
+        to its canonical name (never deleted); if the canonical name is
+        occupied the claim is a redundant older copy and is dropped.
+
+    Both matchers are anchored end-to-end. An unanchored ``find`` on the claim
+    marker also matched a CANONICAL archive whose run id contains the marker
+    (``.r.jsonl.gz.prune-claim.999.jsonl.gz``), and recovery would rename that
+    archive to a name its readers never resolve. The anchored claim grammar is
+    suffix-disjoint from canonical names (which always end ``.jsonl.gz``), so
+    no accepted run id can make one parse as the other.
     """
     try:
         names = sorted(os.listdir(archive_fd))
@@ -2565,13 +2587,10 @@ def _cleanup_archive_temps(archive_fd: int) -> None:
         if _ARCHIVE_TEMP_RE.fullmatch(name):
             _unlink_archive_entry(name, archive_fd)
             continue
-        marker = ".prune-claim."
-        idx = name.find(marker)
-        if idx < 0 or not name.startswith("."):
+        m = _ARCHIVE_CLAIM_RE.fullmatch(name)
+        if m is None:
             continue
-        original = name[1:idx]
-        if not original.endswith(".jsonl.gz"):
-            continue
+        original = m.group("original")
         try:
             st = os.stat(name, dir_fd=archive_fd, follow_symlinks=False)
         except OSError:
