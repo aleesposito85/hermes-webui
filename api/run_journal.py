@@ -29,6 +29,13 @@ RUN_JOURNAL_DIR_NAME = "_run_journal"
 # a wrong retention decision costs one compressed copy instead of the data.
 RUN_JOURNAL_ARCHIVE_DIR_NAME = "_run_journal_archive"
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+# Stray archive temp entries: ``.{run}.jsonl.gz.tmp.{pid}`` — the exact shape
+# ``_archive_run_file`` creates. Matched as the FULL shape (leading dot, a
+# run-id segment, ``.jsonl.gz.tmp.``, digits-only suffix) so a COMPLETED
+# archive whose run id merely contains ``.gz.tmp.`` (e.g. ``r.gz.tmp.x.jsonl.gz``)
+# can never be deleted as debris by the next sweep: substring matching would do
+# exactly that.
+_ARCHIVE_TEMP_RE = re.compile(r"^\.[A-Za-z0-9_.-]+\.jsonl\.gz\.tmp\.\d+$")
 _WRITER_LOCKS: dict[tuple[str, str, str], threading.Lock] = {}
 _WRITER_LOCKS_GUARD = threading.Lock()
 # Next-seq to assign per run-journal file path, kept in memory so repeat appends
@@ -2042,20 +2049,32 @@ def _archive_run_file(
         # 4. Atomic publish (never clobber), then 5. fsync the archive dir.
         #    os.link fails with FileExistsError when an archive for this run id
         #    is already present. That happens after a crash window (archive
-        #    published, live unlink did not run) or a racing attempt; the live
-        #    journal is append-only, so the existing archive is a prefix of the
-        #    current live bytes — if it no longer reproduces them (the live file
-        #    grew since), publish the freshly-verified copy over it; if it does,
-        #    it is already the complete copy.
+        #    published, live unlink did not run) or a racing attempt. The
+        #    stored archive may be REPLACED only by a VERIFIED superset:
+        #      * "equal"  — it already IS the live bytes: keep it, drop the
+        #                    temp;
+        #      * "prefix" — it is a byte-exact prefix of the live bytes (the
+        #                    run grew after the archive was published): the
+        #                    freshly verified copy contains every archived
+        #                    row, so publishing it is safe;
+        #      * "other"  — the live file is a SEPARATE SUFFIX (the run was
+        #                    archived and then appended to again) or a side is
+        #                    unreadable. Replacing would destroy the archived
+        #                    prefix, so BOTH copies are kept: the readers
+        #                    union them, and a missed archive is safe.
         try:
             os.link(tmp_name, archive_path.name, src_dir_fd=archive_fd, dst_dir_fd=archive_fd)
         except FileExistsError:
-            if _archive_reproduces_source(archive_path.name, archive_fd, name, source_fd):
+            relation = _archive_relation_to_source(archive_path.name, archive_fd, name, source_fd)
+            if relation == "equal":
                 _unlink_archive_entry(tmp_name, archive_fd)
-            else:
+            elif relation == "prefix":
                 os.replace(
                     tmp_name, archive_path.name, src_dir_fd=archive_fd, dst_dir_fd=archive_fd
                 )
+            else:
+                _unlink_archive_entry(tmp_name, archive_fd)
+                return 0
         else:
             _unlink_archive_entry(tmp_name, archive_fd)
         # 5. Durability gate. The live file is the ONLY copy until the archive
@@ -2186,17 +2205,27 @@ def _restore_prune_claim(claim: str, name: str, dir_fd: int) -> None:
         logger.warning("Run-journal prune claim left in place (restore failed): %s", claim, exc_info=True)
 
 
-def _entry_exists_at(dir_fd: int, name: str) -> bool:
-    """True when ``name`` exists in the directory pinned by ``dir_fd``.
+def _entry_state_at(dir_fd: int, name: str) -> str:
+    """Three-state existence check for ``name`` in the directory ``dir_fd``.
 
-    No-follow: a symlinked entry still counts as existing (the caller's rule is
-    "keep the archive while ANY live counterpart is present").
+    Returns exactly one of:
+      * ``"present"`` — the entry exists (a symlinked entry counts: the
+        caller's rule is "keep the archive while ANY live counterpart is
+        present");
+      * ``"absent"``  — a CONFIRMED ``FileNotFoundError``: only this state
+        may let a destructive step proceed;
+      * ``"unknown"`` — any other error (``PermissionError``, ``EIO``, a
+        race). The unreadable case must NOT be folded into ``absent``: doing
+        so let the archive TTL prune delete a prefix whose live counterpart
+        still existed, and an unknown live state must preserve the archive.
     """
     try:
         os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
-        return True
+        return "present"
+    except FileNotFoundError:
+        return "absent"
     except OSError:
-        return False
+        return "unknown"
 
 
 def _unlink_archive_entry(name: str, dir_fd: int) -> bool:
@@ -2207,6 +2236,68 @@ def _unlink_archive_entry(name: str, dir_fd: int) -> bool:
         return False
 
 
+def _archive_relation_to_source(
+    gz_name: str,
+    gz_dir_fd: int,
+    source_name: str,
+    source_fd: int,
+) -> str:
+    """Classify an existing archive against the live source bytes.
+
+    Returns one of:
+
+      * ``"equal"``  — the archive decompresses to EXACTLY the live bytes;
+      * ``"prefix"`` — the archive is a byte-exact PREFIX of the live bytes
+        (the run grew after the archive was published), so a freshly built
+        full copy is a verified superset and may replace it;
+      * ``"other"``  — the live file is a separate SUFFIX (the run was
+        archived, then appended to again at the same path) or either side is
+        unreadable/corrupt. Replacing the archive would destroy rows only it
+        holds, so BOTH copies must be kept (readers union them).
+
+    Streams in fixed chunks (never buffering a multi-MB run in memory).
+    """
+    try:
+        gz_fd = os.open(gz_name, os.O_RDONLY | _O_NOFOLLOW, dir_fd=gz_dir_fd)
+    except OSError:
+        return "other"
+    try:
+        src_fd = os.open(source_name, os.O_RDONLY | _O_NOFOLLOW, dir_fd=source_fd)
+    except OSError:
+        try:
+            os.close(gz_fd)
+        except OSError:
+            pass
+        return "other"
+    try:
+        with os.fdopen(gz_fd, "rb", closefd=False) as gz_raw, os.fdopen(
+            src_fd, "rb", closefd=False
+        ) as src:
+            with gzip.GzipFile(fileobj=gz_raw, mode="rb") as gz:
+                while True:
+                    want = gz.read(_RETENTION_VERIFY_CHUNK_BYTES)
+                    if not want:
+                        # Archive ended: "equal" when the live file is done
+                        # too, "prefix" when it continues past the archive.
+                        return "equal" if src.read(1) == b"" else "prefix"
+                    have = b""
+                    while len(have) < len(want):
+                        chunk = src.read(len(want) - len(have))
+                        if not chunk:
+                            break
+                        have += chunk
+                    if want != have:
+                        return "other"
+    except (OSError, EOFError, gzip.BadGzipFile):
+        return "other"
+    finally:
+        for fd in (gz_fd, src_fd):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 def _archive_reproduces_source(
     gz_name: str,
     gz_dir_fd: int,
@@ -2215,45 +2306,12 @@ def _archive_reproduces_source(
 ) -> bool:
     """True when ``gz_name`` (in ``gz_dir_fd``) decompresses to exactly the source bytes.
 
-    Compares in fixed chunks (never buffering a multi-MB run in memory) and
-    requires the decompressed stream to match length AND content. A mismatch
-    means a truncated, corrupt, or superseded archive, so the archive is never
+    Delegates to :func:`_archive_relation_to_source` (single streaming
+    implementation, so the two checks can never drift). A mismatch means a
+    truncated, corrupt, or superseded archive, so the archive is never
     preferred over the live file.
     """
-    try:
-        gz_fd = os.open(gz_name, os.O_RDONLY | _O_NOFOLLOW, dir_fd=gz_dir_fd)
-    except OSError:
-        return False
-    try:
-        src_fd = os.open(source_name, os.O_RDONLY | _O_NOFOLLOW, dir_fd=source_fd)
-    except OSError:
-        try:
-            os.close(gz_fd)
-        except OSError:
-            pass
-        return False
-    try:
-        with os.fdopen(gz_fd, "rb", closefd=False) as gz_raw, os.fdopen(
-            src_fd, "rb", closefd=False
-        ) as src:
-            with gzip.GzipFile(fileobj=gz_raw, mode="rb") as gz:
-                while True:
-                    want = gz.read(_RETENTION_VERIFY_CHUNK_BYTES)
-                    have = src.read(len(want)) if want else b""
-                    if want != have:
-                        return False
-                    if not want:
-                        break
-            # Any extra source bytes mean the live file grew mid-compress.
-            return src.read(1) == b""
-    except (OSError, EOFError, gzip.BadGzipFile):
-        return False
-    finally:
-        for fd in (gz_fd, src_fd):
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+    return _archive_relation_to_source(gz_name, gz_dir_fd, source_name, source_fd) == "equal"
 
 
 def _stat_signature(st: os.stat_result) -> tuple[int, int, int, int, int]:
@@ -2489,8 +2547,10 @@ def _cleanup_archive_temps(archive_fd: int) -> None:
 
     Two shapes:
 
-      * ``.gz.tmp.`` — an aborted archive attempt (the live file survived, so the
-        temp is garbage);
+      * ``.{run}.jsonl.gz.tmp.{pid}`` — an aborted archive attempt (the live
+        file survived, so the temp is garbage). Matched as the FULL shape so a
+        COMPLETED archive whose run id merely contains ``.gz.tmp.`` (e.g.
+        ``r.gz.tmp.x.jsonl.gz``) is never deleted as debris;
       * ``.prune-claim.`` — a prune that was interrupted after claiming an entry
         (crash/power loss between ``rename`` and ``unlink``). The claimed entry
         may be the ONLY copy of that run, so it is RESTORED to its canonical
@@ -2502,7 +2562,7 @@ def _cleanup_archive_temps(archive_fd: int) -> None:
     except OSError:
         return
     for name in names:
-        if ".gz.tmp." in name:
+        if _ARCHIVE_TEMP_RE.fullmatch(name):
             _unlink_archive_entry(name, archive_fd)
             continue
         marker = ".prune-claim."
@@ -2903,12 +2963,15 @@ def _prune_run_journal_archive(session_root: Path, caps: dict, now: float, count
                     # Keep the archive while the run still has live rows: a
                     # prefix must not be pruned out from under a live suffix.
                     # The existence check and the prune share the writer lock
-                    # so an append cannot interleave between them.
+                    # so an append cannot interleave between them. Only a
+                    # CONFIRMED absence may proceed to the destructive step:
+                    # an unreadable live entry (PermissionError / EIO) is an
+                    # UNKNOWN state and keeps the archive (fail closed).
                     live_path = live_root / name / f"{run_stem}.jsonl"
                     with _lock_for(live_path):
-                        if live_session_fd is not None and _entry_exists_at(
+                        if live_session_fd is not None and _entry_state_at(
                             live_session_fd, f"{run_stem}.jsonl"
-                        ):
+                        ) != "absent":
                             continue
                         # Identity is re-asserted inside the unlink (see
                         # `_prune_archive_entry`): a name republished since the

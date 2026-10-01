@@ -254,6 +254,63 @@ def test_complete_existing_archive_is_kept_and_live_file_dropped(tmp_path):
     assert existing.read_bytes() == before
 
 
+def test_second_sweep_keeps_archive_prefix_and_live_suffix(tmp_path):
+    """A separate live suffix must never replace the stored archive prefix.
+
+    Reproduces the finding: the publish step assumed any existing archive was a
+    byte prefix of the live bytes, so after a run was archived and then appended
+    to again at the same path, a second sweep replaced the archive with the
+    compressed SUFFIX — events [1, 2, 3] read back as [3] and session replay
+    returned `replay_noncontiguous`. The publish step now replaces the archive
+    only with a VERIFIED superset (a byte-exact prefix relation); a separate
+    suffix keeps BOTH copies, and the readers union them.
+    """
+    sid, rid = "s1", "r1"
+
+    def _row(seq, name, terminal=False):
+        return {
+            "version": 1, "event_id": f"{rid}:{seq}", "seq": seq, "run_id": rid,
+            "session_id": sid, "event": name, "type": name,
+            "created_at": time.time() - 3600, "terminal": terminal,
+            "terminal_state": "completed" if terminal else None,
+            "payload": {"terminal_state": "completed"} if terminal else {"text": "x"},
+        }
+
+    # Archived prefix: seqs 1 + 2.
+    archive_dir = tmp_path / rj.RUN_JOURNAL_ARCHIVE_DIR_NAME / sid
+    archive_dir.mkdir(parents=True)
+    archive = archive_dir / f"{rid}.jsonl.gz"
+    with gzip.open(archive, "wb") as gz:
+        gz.write(
+            (json.dumps(_row(1, "token"), separators=(",", ":")) + "\n").encode()
+            + (json.dumps(_row(2, "token"), separators=(",", ":")) + "\n").encode()
+        )
+
+    # Live file re-created with the new SUFFIX only (seq 3) and old enough to
+    # be archival-eligible.
+    live_dir = tmp_path / rj.RUN_JOURNAL_DIR_NAME / sid
+    live_dir.mkdir(parents=True)
+    live = live_dir / f"{rid}.jsonl"
+    live.write_text(
+        json.dumps(_row(3, "done", True), separators=(",", ":")) + "\n", encoding="utf-8"
+    )
+    old = time.time() - 30 * 86400
+    os.utime(live, (old, old))
+
+    counters = _sweep(tmp_path, ttl_days=14, max_runs_per_session=0, max_bytes_per_session=0)
+
+    assert counters["archived_files"] == 0, "the live suffix replaced the archive's prefix"
+    with gzip.open(archive, "rb") as fh:
+        kept = fh.read().decode("utf-8")
+    assert f"{rid}:1" in kept and f"{rid}:2" in kept, "the archived prefix was clobbered"
+    assert live.exists(), "the live suffix was dropped"
+    read = rj.read_run_events(sid, rid, session_dir=tmp_path)
+    assert [int(e["seq"]) for e in read["events"]] == [1, 2, 3]
+    replay = rj.read_session_run_events(sid, after_event_id=f"{rid}:1", session_dir=tmp_path)
+    assert replay["status"] == "ok", replay["status"]
+    assert [int(e["seq"]) for e in replay["events"]] == [2, 3]
+
+
 # ── reads fall back to the archive transparently ───────────────────────────
 
 
@@ -472,6 +529,36 @@ def test_stray_temp_files_are_cleaned(tmp_path):
     _sweep(tmp_path, ttl_days=14, max_runs_per_session=0, max_bytes_per_session=0)
     assert not stray.exists()
     assert _archive_path(tmp_path, "s1", "r1").exists()
+
+
+def test_completed_archive_with_tmp_like_run_id_is_not_cleaned(tmp_path):
+    """Temp cleanup must match the FULL temp shape, not a ``.gz.tmp.`` substring.
+
+    Reproduces the finding: cleanup tested ``".gz.tmp." in name``, which also
+    matched a COMPLETED archive whose run id itself contains ``.gz.tmp.``
+    (e.g. run ``r.gz.tmp.x`` -> ``r.gz.tmp.x.jsonl.gz``); the next sweep
+    deleted its only copy. Generated ids are UUID hex so this mostly bites
+    imported/persisted dotted ids, but the cleanup now matches the exact temp
+    shape (leading dot + run segment + ``.jsonl.gz.tmp.`` + digits).
+    """
+    _write_run(tmp_path, "s1", "r1", mtime_age_days=30)
+    archive_session = tmp_path / rj.RUN_JOURNAL_ARCHIVE_DIR_NAME / "s1"
+    archive_session.mkdir(parents=True)
+
+    # A COMPLETED archive whose run id merely contains ".gz.tmp.".
+    completed = archive_session / "r.gz.tmp.x.jsonl.gz"
+    with gzip.open(completed, "wb") as gz:
+        gz.write(b"PRECIOUS\n")
+    # A genuine stray temp (the exact shape _archive_run_file writes).
+    stray = archive_session / ".r1.jsonl.gz.tmp.999999"
+    stray.write_bytes(b"partial")
+
+    _sweep(tmp_path, ttl_days=14, max_runs_per_session=0, max_bytes_per_session=0)
+
+    assert completed.exists(), "a completed archive was deleted as temp debris"
+    with gzip.open(completed, "rb") as fh:
+        assert fh.read() == b"PRECIOUS\n"
+    assert not stray.exists(), "a genuine stray temp was not cleaned"
 
 
 def test_archive_pruning_disabled_by_default(tmp_path):
@@ -1501,3 +1588,66 @@ def test_archive_pruning_does_not_delete_replacement_archive(tmp_path, monkeypat
     # No claim debris left behind.
     claims = list(archive.parent.glob("*.prune-claim.*"))
     assert claims == []
+
+
+def test_prune_keeps_archive_when_live_counterpart_stat_fails(tmp_path, monkeypatch):
+    """An unreadable live counterpart must keep its archive (fail closed).
+
+    Reproduces the finding: the live-counterpart check folded EVERY OSError
+    into "absent", so an injected PermissionError on the stat read as "no live
+    file" and the archive TTL pruned archived event 1 while live event 2 was
+    still present. Only a confirmed FileNotFoundError may read as absent; any
+    other error is an unknown live state and preserves the archive.
+    """
+    sid, rid = "s1", "r1"
+
+    def _row(seq, name, terminal=False):
+        return {
+            "version": 1, "event_id": f"{rid}:{seq}", "seq": seq, "run_id": rid,
+            "session_id": sid, "event": name, "type": name,
+            "created_at": time.time() - 3600, "terminal": terminal,
+            "terminal_state": "completed" if terminal else None,
+            "payload": {"terminal_state": "completed"} if terminal else {"text": "x"},
+        }
+
+    archive_dir = tmp_path / rj.RUN_JOURNAL_ARCHIVE_DIR_NAME / sid
+    archive_dir.mkdir(parents=True)
+    archive = archive_dir / f"{rid}.jsonl.gz"
+    with gzip.open(archive, "wb") as gz:
+        gz.write((json.dumps(_row(1, "token"), separators=(",", ":")) + "\n").encode())
+    old = time.time() - 400 * 86400
+    os.utime(archive, (old, old))
+
+    # Control: a second aged archive with NO live counterpart is still pruned.
+    control = archive_dir / "r2.jsonl.gz"
+    with gzip.open(control, "wb") as gz:
+        gz.write(b'{"version":1}\n')
+    os.utime(control, (old, old))
+
+    # Live counterpart for r1 (event 2), freshly written (below every cap).
+    live_dir = tmp_path / rj.RUN_JOURNAL_DIR_NAME / sid
+    live_dir.mkdir(parents=True)
+    live = live_dir / f"{rid}.jsonl"
+    live.write_text(
+        json.dumps(_row(2, "done", True), separators=(",", ":")) + "\n", encoding="utf-8"
+    )
+
+    real_stat = os.stat
+
+    def flaky_stat(path="", *args, **kwargs):
+        if path == f"{rid}.jsonl" and kwargs.get("dir_fd") is not None:
+            raise PermissionError("injected: live counterpart unreadable")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(rj.os, "stat", flaky_stat)
+    monkeypatch.setenv(rj._RETENTION_ARCHIVE_TTL_ENV, "30")
+    counters = rj.sweep_run_journal(
+        session_dir=tmp_path, ttl_days=0, max_runs_per_session=0, max_bytes_per_session=0
+    )
+
+    assert archive.exists(), "a PermissionError on the live counterpart let the prune delete the archive"
+    assert counters["pruned_archives"] == 1, "the control archive without a live counterpart must still prune"
+    assert not control.exists()
+    assert live.exists()
+    read = rj.read_run_events(sid, rid, session_dir=tmp_path)
+    assert [int(e["seq"]) for e in read["events"]] == [1, 2]
