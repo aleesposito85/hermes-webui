@@ -2857,6 +2857,106 @@ def _sweep_run_journal_session(
                     pass
 
 
+def _live_run_state_locked(
+    live_root: Path, session_name: str, run_stem: str, holder: dict
+) -> str:
+    """Three-state live state for ``<session>/<run_stem>.jsonl`` — under the lock.
+
+    Callers MUST hold ``_lock_for`` for that run's live path. The state is
+    (re)read HERE, inside that lock, because anything the prune learned earlier
+    in the pass can be stale by now: a writer may have created the live root,
+    the session directory, or the run's suffix since. ``holder`` caches the
+    live-root fd for the whole prune; when the root was absent at pass start,
+    the pin is retried here — still under the lock — so a tree created
+    mid-pass is seen before any destructive step.
+
+    Returns ``"present"`` / ``"absent"`` / ``"unknown"``; only a confirmed
+    ``"absent"`` (``FileNotFoundError`` at every level, observed under the
+    lock) may let the caller prune. A symlinked or unreadable root/session is
+    ``"unknown"`` and keeps the archive (fail closed).
+    """
+    fd = int(holder.get("fd", -1))
+    if fd < 0:
+        try:
+            fd = os.open(str(live_root), os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW)
+        except FileNotFoundError:
+            return "absent"
+        except OSError:
+            return "unknown"
+        holder["fd"] = fd
+    try:
+        session_fd = os.open(
+            session_name, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW, dir_fd=fd
+        )
+    except FileNotFoundError:
+        return "absent"
+    except OSError:
+        return "unknown"
+    try:
+        return _entry_state_at(session_fd, f"{run_stem}.jsonl")
+    finally:
+        try:
+            os.close(session_fd)
+        except OSError:
+            pass
+
+
+def _recover_archive_claims(session_root: Path) -> None:
+    """Restore/clear stale archive debris across EVERY archived session.
+
+    Claim recovery (and stray-temp cleanup) must not depend on live-session
+    enumeration: a session that exists only in the archive — its live
+    directory was removed, or this machine never had one — is not visited by
+    the per-session sweep, so a claim left by an interrupted prune would hide
+    the run's ONLY copy under a dot-prefixed name forever. This walks the
+    pinned archive root directly (independent of the live root and of the
+    sweep's live-root early return), taking each session's lock
+    non-blockingly so an in-flight deletion is skipped, not raced.
+    """
+    opened = _open_archive_root_no_follow(session_root)
+    if opened is None:
+        return
+    root_fd, _parent_synced = opened
+    try:
+        try:
+            names = sorted(os.listdir(root_fd))
+        except OSError:
+            return
+        for name in names:
+            if name.startswith(".") or not _SAFE_ID_RE.fullmatch(name):
+                continue  # dot-prefixed: this module's own deletion debris
+            session_lock = _session_lock_for(session_root, name)
+            if not session_lock.acquire(blocking=False):
+                continue
+            try:
+                try:
+                    st = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+                except OSError:
+                    continue
+                if not stat.S_ISDIR(st.st_mode):
+                    continue
+                try:
+                    session_fd = os.open(
+                        name, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW, dir_fd=root_fd
+                    )
+                except OSError:
+                    continue
+                try:
+                    _cleanup_archive_temps(session_fd)
+                finally:
+                    try:
+                        os.close(session_fd)
+                    except OSError:
+                        pass
+            finally:
+                session_lock.release()
+    finally:
+        try:
+            os.close(root_fd)
+        except OSError:
+            pass
+
+
 def _prune_run_journal_archive(session_root: Path, caps: dict, now: float, counters: dict) -> None:
     """Delete archived runs older than the archive TTL (the ONLY destructive step).
 
@@ -2923,33 +3023,17 @@ def _prune_run_journal_archive(session_root: Path, caps: dict, now: float, count
                 )
             except OSError:
                 continue
-            # Pinned handle for the live counterpart of this session, opened
-            # RELATIVE to the pinned live root. Three outcomes:
-            #   * open succeeds    -> check the run's live entry below;
-            #   * ENOENT           -> the session has no live directory at all
-            #                         (every run fully archived): age-only
-            #                         pruning is safe;
-            #   * any other error  -> the live state is UNKNOWN (a symlinked
-            #                         or unreadable entry): preserve every
-            #                         archive for this session (fail closed),
-            #                         because this check is the only thing
-            #                         protecting prefix+live pairs.
-            live_session_fd = None
-            live_session_unknown = False
-            if live_root_fd >= 0:
-                try:
-                    live_session_fd = os.open(
-                        name, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW, dir_fd=live_root_fd
-                    )
-                except FileNotFoundError:
-                    live_session_fd = None
-                except OSError:
-                    live_session_unknown = True
+            # The live state is read INSIDE each run's writer lock below (via
+            # `_live_run_state_locked`). Anything captured earlier — even a
+            # session handle opened just before this lock — is already stale:
+            # a writer can create the live root, the session directory, and
+            # the run's suffix at any moment, and a check against that stale
+            # view misses it and prunes the archived prefix out from under
+            # its live suffix. `holder` caches the live-root pin for the
+            # whole prune; a root that was absent at pass start (fd -1) is
+            # re-pinned under the lock so a tree created mid-pass is seen.
+            holder = {"fd": live_root_fd}
             try:
-                if live_session_unknown:
-                    # The session's live state cannot be established: keep
-                    # every archive for it (fail closed).
-                    continue
                 for entry in sorted(os.listdir(session_fd)):
                     if not entry.endswith(".jsonl.gz"):
                         continue
@@ -2962,16 +3046,16 @@ def _prune_run_journal_archive(session_root: Path, caps: dict, now: float, count
                         continue
                     # Keep the archive while the run still has live rows: a
                     # prefix must not be pruned out from under a live suffix.
-                    # The existence check and the prune share the writer lock
-                    # so an append cannot interleave between them. Only a
-                    # CONFIRMED absence may proceed to the destructive step:
-                    # an unreadable live entry (PermissionError / EIO) is an
-                    # UNKNOWN state and keeps the archive (fail closed).
+                    # Only a CONFIRMED absence observed UNDER the writer lock
+                    # may proceed to the destructive step: an unreadable or
+                    # symlinked live state is UNKNOWN and keeps the archive
+                    # (fail closed).
                     live_path = live_root / name / f"{run_stem}.jsonl"
                     with _lock_for(live_path):
-                        if live_session_fd is not None and _entry_state_at(
-                            live_session_fd, f"{run_stem}.jsonl"
-                        ) != "absent":
+                        if (
+                            _live_run_state_locked(live_root, name, run_stem, holder)
+                            != "absent"
+                        ):
                             continue
                         # Identity is re-asserted inside the unlink (see
                         # `_prune_archive_entry`): a name republished since the
@@ -2979,12 +3063,19 @@ def _prune_run_journal_archive(session_root: Path, caps: dict, now: float, count
                         if _prune_archive_entry(entry, st, session_fd):
                             counters["pruned_archives"] += 1
             finally:
-                for fd in (live_session_fd, session_fd):
-                    if fd is not None:
-                        try:
-                            os.close(fd)
-                        except OSError:
-                            pass
+                fd = int(holder.get("fd", -1))
+                if fd >= 0 and fd != live_root_fd:
+                    # Re-pinned mid-pass: close it here. The outer finally
+                    # still owns (and closes) the pass-start pin.
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                if session_fd is not None:
+                    try:
+                        os.close(session_fd)
+                    except OSError:
+                        pass
     finally:
         for fd in (root_fd, live_root_fd):
             if fd >= 0:
@@ -3053,6 +3144,15 @@ def sweep_run_journal(
     # because enumeration and every per-session open go through this handle.
     journal_root_fd = _open_dir_no_follow(journal_root)
     if journal_root_fd is None:
+        # No live root (or it cannot be trusted): the archival sweep has
+        # nothing to do, but archive-only recovery still must run — a claim
+        # left by an interrupted prune in a session that exists ONLY in the
+        # archive would otherwise stay hidden forever.
+        try:
+            _recover_archive_claims(root)
+        except Exception:
+            counters["errors"] += 1
+            logger.warning("Run-journal archive claim recovery failed", exc_info=True)
         return counters
     try:
         try:
@@ -3106,6 +3206,14 @@ def sweep_run_journal(
             except Exception:
                 counters["errors"] += 1
                 logger.warning("Run-journal archive prune failed", exc_info=True)
+            # Recovery also covers sessions that exist ONLY in the archive
+            # while other sessions are live: the per-session sweep above only
+            # visits live-enumerated sessions, so it cannot see them.
+            try:
+                _recover_archive_claims(root)
+            except Exception:
+                counters["errors"] += 1
+                logger.warning("Run-journal archive claim recovery failed", exc_info=True)
     finally:
         try:
             os.close(journal_root_fd)

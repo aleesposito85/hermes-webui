@@ -1651,3 +1651,141 @@ def test_prune_keeps_archive_when_live_counterpart_stat_fails(tmp_path, monkeypa
     assert live.exists()
     read = rj.read_run_events(sid, rid, session_dir=tmp_path)
     assert [int(e["seq"]) for e in read["events"]] == [1, 2]
+
+
+def test_prune_sees_live_suffix_created_after_the_session_probe(tmp_path, monkeypatch):
+    """A live session created mid-pass must block the prune (fail closed).
+
+    Reproduces the finding: the prune captured each session's live-directory
+    handle ONCE per session (outside the writer lock). When the session had no
+    live directory at that moment, a writer that created it — and appended a
+    suffix — before the per-run check was invisible, and the archived prefix
+    was pruned (`replay_noncontiguous`). The state is now read INSIDE the
+    writer lock, where the writer's mkdir+append is visible.
+    """
+    sid, rid = "s1", "r1"
+
+    def _row(seq, name, terminal=False):
+        return {
+            "version": 1, "event_id": f"{rid}:{seq}", "seq": seq, "run_id": rid,
+            "session_id": sid, "event": name, "type": name,
+            "created_at": time.time() - 3600, "terminal": terminal,
+            "terminal_state": "completed" if terminal else None,
+            "payload": {"terminal_state": "completed"} if terminal else {"text": "x"},
+        }
+
+    # Aged archived prefix: seqs 1 + 2.
+    archive_dir = tmp_path / rj.RUN_JOURNAL_ARCHIVE_DIR_NAME / sid
+    archive_dir.mkdir(parents=True)
+    archive = archive_dir / f"{rid}.jsonl.gz"
+    with gzip.open(archive, "wb") as gz:
+        gz.write((json.dumps(_row(1, "token"), separators=(",", ":")) + "\n").encode()
+                 + (json.dumps(_row(2, "token"), separators=(",", ":")) + "\n").encode())
+    old = time.time() - 400 * 86400
+    os.utime(archive, (old, old))
+
+    # The live root exists but has NO s1 directory yet: the writer has not
+    # created it. That is the state the old per-session probe froze.
+    (tmp_path / rj.RUN_JOURNAL_DIR_NAME).mkdir(parents=True)
+
+    # The writer creates the session dir + appends its suffix at the moment
+    # the prune takes the run's writer lock — i.e. after any pre-lock probe.
+    live_path = tmp_path / rj.RUN_JOURNAL_DIR_NAME / sid / f"{rid}.jsonl"
+    real_lock_for = rj._lock_for
+    state = {"done": False}
+
+    def lock_for_then_write(path):
+        lock = real_lock_for(path)
+        if not state["done"] and str(path) == str(live_path):
+            state["done"] = True
+            rj.append_run_event(
+                sid, rid, "done", {"terminal_state": "completed"},
+                session_dir=tmp_path, seq=3,
+            )
+        return lock
+
+    monkeypatch.setattr(rj, "_lock_for", lock_for_then_write)
+    monkeypatch.setenv(rj._RETENTION_ARCHIVE_TTL_ENV, "30")
+    counters = rj.sweep_run_journal(
+        session_dir=tmp_path, ttl_days=0, max_runs_per_session=0, max_bytes_per_session=0
+    )
+
+    assert state["done"], "test did not fire the mid-pass writer"
+    assert archive.exists(), "prune deleted the prefix although a live suffix was created under its lock"
+    assert counters["pruned_archives"] == 0
+    read = rj.read_run_events(sid, rid, session_dir=tmp_path)
+    assert [int(e["seq"]) for e in read["events"]] == [1, 2, 3]
+    replay = rj.read_session_run_events(sid, after_event_id=f"{rid}:1", session_dir=tmp_path)
+    assert replay["status"] == "ok", replay["status"]
+
+
+def _claim_in_archive_only_session(tmp_path, sid, rid, live_root_state):
+    """Helper: a stale prune claim for a session that has no live directory."""
+    archive_dir = tmp_path / rj.RUN_JOURNAL_ARCHIVE_DIR_NAME / sid
+    archive_dir.mkdir(parents=True)
+    claim = archive_dir / f".{rid}.jsonl.gz.prune-claim.999"
+    with gzip.open(claim, "wb") as gz:
+        gz.write(
+            (json.dumps(
+                {"version": 1, "event_id": f"{rid}:1", "seq": 1, "run_id": rid,
+                 "session_id": sid, "event": "done", "type": "done",
+                 "created_at": time.time() - 3600, "terminal": True,
+                 "terminal_state": "completed", "payload": {"terminal_state": "completed"}},
+                separators=(",", ":"),
+            ) + "\n").encode()
+        )
+    old = time.time() - 7200  # past the quiescence window
+    os.utime(claim, (old, old))
+    if live_root_state == "empty":
+        (tmp_path / rj.RUN_JOURNAL_DIR_NAME).mkdir(parents=True)
+    return archive_dir / f"{rid}.jsonl.gz", claim
+
+
+def test_archive_only_session_claim_recovered_without_live_root(tmp_path, monkeypatch):
+    """A crash-left claim in an archive-only session is restored even when the
+    live journal root does not exist at all.
+
+    Reproduces the finding: claim recovery ran only from the per-session sweep,
+    which is only reached for LIVE-enumerated sessions, and the sweep returned
+    early when the live root was absent — so a claim left by an interrupted
+    prune stayed hidden forever and ``find_run_summary`` returned None for the
+    run's only copy. Recovery now walks the archive root independently.
+    """
+    sid, rid = "s1", "r1"
+    canonical, claim = _claim_in_archive_only_session(tmp_path, sid, rid, "absent")
+
+    monkeypatch.setenv(rj._RETENTION_ARCHIVE_TTL_ENV, "30")
+    counters = rj.sweep_run_journal(
+        session_dir=tmp_path, ttl_days=0, max_runs_per_session=0, max_bytes_per_session=0
+    )
+
+    assert counters["errors"] == 0
+    assert canonical.exists(), "the claim was not restored (only copy stayed hidden)"
+    assert not claim.exists(), "claim debris left behind"
+    summary = rj.find_run_summary(rid, session_dir=tmp_path)
+    assert summary is not None, "the run's only copy is unreachable"
+
+
+def test_archive_only_session_claim_recovered_with_empty_live_root(tmp_path, monkeypatch):
+    """Same as above, with the live root present but this session absent from it.
+
+    This is the case the maintainer reproduced through ``sweep_run_journal()``:
+    the live root exists (other sessions are live), the claim's session exists
+    ONLY in the archive, and the per-session sweep never visits it.
+    """
+    sid, rid = "s1", "r1"
+    canonical, claim = _claim_in_archive_only_session(tmp_path, sid, rid, "empty")
+    # A second, LIVE session, so the sweep does not early-return.
+    other = tmp_path / rj.RUN_JOURNAL_DIR_NAME / "s2"
+    other.mkdir(parents=True)
+
+    monkeypatch.setenv(rj._RETENTION_ARCHIVE_TTL_ENV, "30")
+    counters = rj.sweep_run_journal(
+        session_dir=tmp_path, ttl_days=0, max_runs_per_session=0, max_bytes_per_session=0
+    )
+
+    assert counters["errors"] == 0
+    assert canonical.exists(), "the claim was not restored (only copy stayed hidden)"
+    assert not claim.exists(), "claim debris left behind"
+    summary = rj.find_run_summary(rid, session_dir=tmp_path)
+    assert summary is not None, "the run's only copy is unreachable"
